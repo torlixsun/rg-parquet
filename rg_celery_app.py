@@ -280,6 +280,26 @@ def export_all_tables(self, hostname: str, target_month: str):
         s3_path = f"s3://rg-datalake-{year}/{tb}/{hostname}.parquet"
 
         try:
+            # ---- Idempotency check: skip if already on Seagate ----
+            check = subprocess.run(
+                ["aws", "s3", "ls", s3_path,
+                 "--profile", AWS_PROFILE,
+                 "--endpoint-url", SEAGATE_ENDPOINT],
+                capture_output=True, text=True, timeout=60,
+            )
+            if check.returncode == 0 and f"{hostname}.parquet" in check.stdout:
+                logger.info("[%s] %s already on Seagate, skipping", hostname, tb)
+                # Still need to verify row counts
+                local_count = int(
+                    subprocess.check_output(
+                        ["clickhouse-client", "-m", "--password", CH_LOCAL_PASSWORD,
+                         "-q", f"SELECT count() FROM {CH_LOCAL_DB}.local_{tb}"],
+                        text=True, timeout=120,
+                    ).strip()
+                )
+                logger.info("[%s] %s local count: %d (skipped, already uploaded)", hostname, tb, local_count)
+                continue
+
             # mkdir + permissions
             subprocess.run(["mkdir", "-pv", export_dir], check=True)
             subprocess.run(["chown", "-R", "clickhouse:clickhouse", export_dir], check=True)
