@@ -1,0 +1,6 @@
+celery[redis]>=5.3
+clickhouse-driver>=0.2.6
+mysql-connector-python>=8.0
+python-dotenv>=1.0
+requests>=2.31
+flask>=3.0

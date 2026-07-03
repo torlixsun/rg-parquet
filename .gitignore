@@ -1,0 +1,25 @@
+# Celery / Flask
+*.pyc
+__pycache__/
+*.egg-info/
+
+# DB / State
+*.db
+.dispatch_state.json
+
+# Env
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+log/
