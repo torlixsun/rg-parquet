@@ -85,10 +85,17 @@ app.conf.update(
     result_serializer="json",
     timezone="Asia/Shanghai",
     enable_utc=False,
+    # Long-running tasks (up to 24h+), no hard limit
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_soft_time_limit=7200,   # 2 hr per server
-    task_time_limit=7500,
+    task_soft_time_limit=None,   # disabled — tasks may run 24h+
+    task_time_limit=None,        # disabled
+    # Prevent Redis from redelivering long tasks
+    broker_transport_options={
+        "visibility_timeout": 172800,  # 48 hours
+    },
+    # Clean up old results to avoid Redis OOM
+    result_expires=604800,  # 7 days
     beat_schedule={
         "check-solr-info-every-10min": {
             "task": "rg_celery_app.check_and_dispatch",
@@ -290,7 +297,7 @@ def export_all_tables(self, hostname: str, target_month: str):
                         f"output_format_parquet_compression_method = 'zstd', "
                         f"max_memory_usage = 40000000000",
                     ],
-                    capture_output=True, text=True, timeout=1800,
+                    capture_output=True, text=True, timeout=3600,
                 )
                 if proc.returncode == 0:
                     break
@@ -307,7 +314,7 @@ def export_all_tables(self, hostname: str, target_month: str):
                         "--profile", AWS_PROFILE,
                         "--endpoint-url", SEAGATE_ENDPOINT,
                     ],
-                    capture_output=True, text=True, timeout=600,
+                    capture_output=True, text=True, timeout=1800,
                 )
                 if proc.returncode == 0:
                     break
