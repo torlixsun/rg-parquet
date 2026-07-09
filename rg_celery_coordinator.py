@@ -1,8 +1,7 @@
 """
-RG Export Coordinator — Flask Status API (thin wrapper)
-========================================================
-Provides read-only status endpoints for monitoring.
-The real orchestration is done by Celery Beat + Workers.
+RG Export Coordinator — Flask API + Dispatch Trigger
+=====================================================
+Thin status API. The real orchestration is done by Celery workers.
 
 Usage:
     python3 rg_celery_coordinator.py
@@ -15,7 +14,7 @@ from datetime import datetime
 
 from celery import Celery
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
@@ -26,7 +25,6 @@ DISPATCH_STATE_FILE = os.path.join(
 
 app = Flask(__name__)
 
-# Celery inspect (read-only)
 celery_app = Celery("rg_export", broker=REDIS_URL, backend=REDIS_URL)
 
 
@@ -45,10 +43,9 @@ def ping():
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    """Return dispatch state + worker ping info."""
+    """Return dispatch state + worker stats."""
     state = _load_dispatch_state()
 
-    # Try to get worker stats from Celery
     workers_info = {}
     try:
         inspect = celery_app.control.inspect(timeout=5)
@@ -74,32 +71,40 @@ def status():
     })
 
 
-@app.route("/api/ready", methods=["GET"])
-def ready():
-    """Check if export is ready (same logic as beat, but manual)."""
-    from rg_celery_app import _is_ready
-    ready, current_month, reason = _is_ready()
-    state = _load_dispatch_state()
-    return jsonify({
-        "ready": ready,
-        "current_month": current_month,
-        "reason": reason,
-        "dispatched_month": state.get("dispatched_month"),
-        "completed": state.get("completed", False),
-    })
-
-
 @app.route("/api/dispatch", methods=["POST"])
 def manual_dispatch():
-    """Manually trigger dispatch (bypasses beat schedule)."""
-    from rg_celery_app import check_and_dispatch
-    result = check_and_dispatch.delay()
-    return jsonify({"task_id": result.id, "message": "Dispatch check queued"})
+    """
+    Trigger export dispatch for a given month.
+    Query: ?month=YYYYMM  (required)
+    Idempotent — same month only dispatched once (via .dispatch_state.json).
+    """
+    target_month = request.args.get("month", "").strip()
+    if not target_month or len(target_month) != 6 or not target_month.isdigit():
+        return jsonify({"error": "Missing or invalid 'month' parameter. Use YYYYMM."}), 400
+
+    state = _load_dispatch_state()
+    dispatched_month = state.get("dispatched_month")
+
+    if dispatched_month == target_month:
+        if state.get("completed"):
+            return jsonify({"status": "rejected", "reason": "already_completed", "month": target_month})
+        if state.get("running_month") == target_month:
+            return jsonify({"status": "rejected", "reason": "still_running", "month": target_month})
+        return jsonify({"status": "rejected", "reason": "already_dispatched", "month": target_month})
+
+    from rg_celery_app import dispatch_export
+    result = dispatch_export.delay(target_month)
+
+    return jsonify({
+        "status": "dispatched",
+        "month": target_month,
+        "task_id": result.id,
+    })
 
 
 @app.route("/api/reset", methods=["POST"])
 def reset_cycle():
-    """Reset dispatch state for a new month."""
+    """Reset dispatch state for re-run (emergency use)."""
     try:
         os.remove(DISPATCH_STATE_FILE)
     except FileNotFoundError:
@@ -109,5 +114,5 @@ def reset_cycle():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"Starting Coordinator status API on 0.0.0.0:{port}")
+    print(f"Starting Coordinator API on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)

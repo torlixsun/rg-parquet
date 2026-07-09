@@ -1,14 +1,16 @@
 """
 RG Export — Celery Application
 ===============================
-- Celery Beat: periodically checks MySQL solr_info, dispatches export when ready
-- Workers:  12 servers (lweb-rg-001 ~ 012), each runs export_all_tables on its own queue
-- Master:   chord → comparison → alert
+- Dispatch: triggered externally via /api/dispatch?month=YYYYMM (by MySQL trigger script)
+- Workers: 12 servers (lweb-rg-001 ~ 012), each runs export_all_tables on its own queue
+- Master:  chord callback → comparison → alert
+
+No MySQL dependency — dispatch is externally triggered. Idempotency via .dispatch_state.json.
 
 Deployment:
-  Master (1 machine):
-    celery -A rg_celery_app beat -l info
-    python3 rg_celery_coordinator.py    # Flask status API (optional)
+  Coordinator (1 machine, needs Redis + ClickHouse for comparison):
+    celery -A rg_celery_app worker -Q coordinator -n coordinator@%h -l info --concurrency=1
+    python3 rg_celery_coordinator.py    # Flask API + dispatch trigger
 
   Worker (12 machines, one each):
     celery -A rg_celery_app worker -Q {hostname} -n {hostname}@%h -l info --concurrency=1
@@ -16,17 +18,13 @@ Deployment:
 
 import json
 import os
-import re
 import subprocess
-import tempfile
 from datetime import datetime
 
 import clickhouse_driver
-import mysql.connector
 import requests
 from celery import Celery, chord, group
-from celery.schedules import crontab
-from celery.signals import beat_init, worker_ready
+from celery.signals import worker_ready
 from celery.utils.log import get_task_logger
 from dotenv import load_dotenv
 
@@ -38,13 +36,6 @@ logger = get_task_logger(__name__)
 # Config from .env
 # ============================================================
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-
-# MySQL
-MYSQL_HOST = os.environ["MYSQL_HOST"]
-MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
-MYSQL_USER = os.environ["MYSQL_USER"]
-MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
-MYSQL_DATABASE = os.environ.get("MYSQL_DATABASE", "actonia")
 
 # Worker ClickHouse
 CH_LOCAL_HOST = os.environ.get("CH_LOCAL_HOST", "127.0.0.1")
@@ -61,7 +52,7 @@ CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "clarity
 # Alert
 ALERT_URL = os.environ.get("ALERT_URL", "http://69.175.99.218:8090/api/v1/alert")
 ALERT_API_KEY = os.environ.get("ALERT_API_KEY", "")
-ALERT_CHANNEL = os.environ.get("ALERT_CHANNEL", "actonia-alerts")
+ALERT_CHANNEL = os.environ.get("ALERT_CHANNEL", "actoniaalerts")
 
 # Seagate
 SEAGATE_KEY_ID = os.environ.get("SEAGATE_KEY_ID", "")
@@ -69,7 +60,7 @@ SEAGATE_SECRET = os.environ.get("SEAGATE_SECRET", "")
 AWS_PROFILE = os.environ.get("AWS_PROFILE", "seagate")
 SEAGATE_ENDPOINT = os.environ.get("SEAGATE_ENDPOINT", "https://s3.clarity1.lyve.seagate.com")
 
-# Dispatch state file (tracks which months have been dispatched)
+# Dispatch state file (tracks which months have been dispatched — idempotency layer)
 DISPATCH_STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".dispatch_state.json"
 )
@@ -88,20 +79,14 @@ app.conf.update(
     # Long-running tasks (up to 24h+), no hard limit
     task_acks_late=True,
     worker_prefetch_multiplier=1,
-    task_soft_time_limit=None,   # disabled — tasks may run 24h+
-    task_time_limit=None,        # disabled
+    task_soft_time_limit=None,
+    task_time_limit=None,
     # Prevent Redis from redelivering long tasks
     broker_transport_options={
         "visibility_timeout": 172800,  # 48 hours
     },
     # Clean up old results to avoid Redis OOM
     result_expires=604800,  # 7 days
-    beat_schedule={
-        "check-solr-info-every-10min": {
-            "task": "rg_celery_app.check_and_dispatch",
-            "schedule": crontab(minute="*/10"),
-        },
-    },
 )
 
 # 12 servers
@@ -144,50 +129,6 @@ def _dispatch_state_save(state):
         json.dump(state, f)
 
 
-def _get_mysql_solr_info():
-    conn = mysql.connector.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        charset="utf8mb4",
-    )
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, country_code, solr_month, solr_url "
-            "FROM solr_info "
-            "WHERE solr_month >= 201901 AND solr_type = 19 "
-            "ORDER BY id"
-        )
-        return cursor.fetchall()
-    finally:
-        conn.close()
-
-
-def _is_ready():
-    """
-    Ready when 4 rows exist (US_D, US_M, INTL_D, INTL_M)
-    AND all solr_month == current YYYYMM.
-    """
-    current_month = int(datetime.now().strftime("%Y%m"))
-    rows = _get_mysql_solr_info()
-
-    if not rows:
-        return False, current_month, "no rows"
-
-    expected = {"US_D", "US_M", "INTL_D", "INTL_M"}
-    found = {r[1] for r in rows}
-    if found != expected:
-        return False, current_month, f"missing: {expected-found}, extra: {found-expected}"
-
-    if all(r[2] == current_month for r in rows):
-        return True, current_month, "all ready"
-    months = {r[1]: r[2] for r in rows}
-    return False, current_month, f"months: {months}"
-
-
 def _send_alert(title, message, level, tags):
     try:
         requests.post(
@@ -211,32 +152,30 @@ def _send_alert(title, message, level, tags):
 
 
 # ============================================================
-# Beat Task — check solr_info and dispatch
+# Dispatch Task — triggered externally via API
 # ============================================================
-@app.task(name="rg_celery_app.check_and_dispatch")
-def check_and_dispatch():
-    """Periodically called by Celery Beat. When solr_info ready, dispatch export chord."""
-    ready, current_month, reason = _is_ready()
+@app.task(name="rg_celery_app.dispatch_export")
+def dispatch_export(target_month: str):
+    """
+    Dispatch export for a given month. Idempotent — same month only dispatched once.
+    Called by Flask /api/dispatch?month=YYYYMM
+    Runs on coordinator queue (has access to .dispatch_state.json + ClickHouse for comparison).
+    """
     state = _dispatch_state_load()
     dispatched_month = state.get("dispatched_month")
-    target_month = str(current_month)
 
-    logger.info("check_and_dispatch: ready=%s month=%s reason=%s", ready, current_month, reason)
+    logger.info("dispatch_export: month=%s, dispatched=%s", target_month, dispatched_month)
 
-    if not ready:
-        return {"ready": False, "month": target_month, "reason": reason}
-
+    # ---- Idempotency: already dispatched this month ----
     if dispatched_month == target_month:
         if state.get("completed"):
-            return {"ready": True, "month": target_month, "status": "already_completed"}
-        still_running = state.get("running_month") == target_month
-        return {
-            "ready": True,
-            "month": target_month,
-            "status": "already_dispatched" if not still_running else "still_running",
-        }
+            return {"status": "already_completed", "month": target_month}
+        if state.get("running_month") == target_month:
+            return {"status": "still_running", "month": target_month}
+        # Should not happen, but guard anyway
+        return {"status": "already_dispatched", "month": target_month}
 
-    # ---- Dispatch! ----
+    # ---- Dispatch ----
     logger.info("Dispatching export for %s on %d servers", target_month, len(RG_SERVERS))
 
     state["dispatched_month"] = target_month
@@ -249,9 +188,9 @@ def check_and_dispatch():
         export_all_tables.s(hostname, target_month).set(queue=hostname)
         for hostname in RG_SERVERS
     )
-    workflow = chord(header)(finalize_export.s(target_month))
+    chord(header)(finalize_export.s(target_month))
 
-    return {"ready": True, "month": target_month, "status": "dispatched"}
+    return {"status": "dispatched", "month": target_month}
 
 
 # ============================================================
@@ -266,7 +205,7 @@ def export_all_tables(self, hostname: str, target_month: str):
     """
     year = target_month[:4]
     tables = [t.format(m=target_month) for t in RG_TABLES]
-    host_short = hostname  # or use socket.gethostname()
+    host_short = hostname
 
     failed_tables = []
 
@@ -275,7 +214,6 @@ def export_all_tables(self, hostname: str, target_month: str):
     for tb in tables:
         logger.info("[%s] Processing %s", hostname, tb)
         export_dir = f"/data/exports/{tb}"
-        parquet_file = f"{export_dir}/{hostname}.parquet"
         user_files_path = f"/etc/clickhouse-server/user_files/exports/{tb}/{hostname}.parquet"
         s3_path = f"s3://rg-datalake-{year}/{tb}/{hostname}.parquet"
 
@@ -289,7 +227,6 @@ def export_all_tables(self, hostname: str, target_month: str):
             )
             if check.returncode == 0 and f"{hostname}.parquet" in check.stdout:
                 logger.info("[%s] %s already on Seagate, skipping", hostname, tb)
-                # Still need to verify row counts
                 local_count = int(
                     subprocess.check_output(
                         ["clickhouse-client", "-m", "--password", CH_LOCAL_PASSWORD,
@@ -378,7 +315,6 @@ def export_all_tables(self, hostname: str, target_month: str):
         except Exception as exc:
             logger.error("[%s] %s ERROR: %s", hostname, tb, exc)
             failed_tables.append(tb)
-            # Cleanup attempt
             subprocess.run(["rm", "-rf", export_dir], check=False)
 
     status = "done" if not failed_tables else "failed"
@@ -402,7 +338,6 @@ def finalize_export(results, target_month):
     """
     logger.info("All 12 servers finished. Results: %s", results)
 
-    # Check if any server failed
     failed_servers = [r for r in results if r.get("status") != "done"]
     if failed_servers:
         names = [r["hostname"] for r in failed_servers]
@@ -415,11 +350,9 @@ def finalize_export(results, target_month):
         _mark_completed(target_month)
         return {"status": "partial_failure", "failed_servers": names}
 
-    # ---- Run comparison ----
     logger.info("Running comparison for %s", target_month)
     all_ok, details = _run_comparison(target_month)
 
-    # Build summary
     lines = []
     mismatch_count = 0
     for d in details:
@@ -520,8 +453,3 @@ def _mark_completed(target_month):
 @worker_ready.connect
 def on_worker_ready(sender, **kwargs):
     logger.info("Worker ready: %s", sender.hostname)
-
-
-@beat_init.connect
-def on_beat_init(sender, **kwargs):
-    logger.info("Beat scheduler started")
