@@ -5,7 +5,6 @@ Polling-based distributed export pipeline for ResearchGrid (RG) monthly ranking 
 Exports 16 ClickHouse tables per server (× 12 servers `lweb-rg-001` ~ `012`) to Parquet → uploads to Seagate S3 → validates row counts → cross-checks local vs cloud → sends alerts.
 
 > **Architecture**: Flask + SQLite controller with worker cron scripts. No Celery, no Redis.
-> `architecture.md` describes the *legacy* Celery+Redis design and is kept for reference only.
 
 ## Architecture
 
@@ -132,10 +131,9 @@ Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay
 ├── rg_worker.sh              # Worker poll/claim/export/upload script (cron on each server)
 ├── rg_trigger.sh             # Monthly trigger script (cron on b80)
 ├── start_controller.sh       # Controller startup
-├── README.md                 # This file
-└── architecture.md           # LEGACY Celery+Redis design doc (reference only)
+└── README.md                 # This file
 ```
 
 ## Legacy (Celery + Redis)
 
-`rg_celery_app.py`, `rg_celery_coordinator.py`, `start_master.sh`, `start_worker.sh`, `docker-compose.yml`, `redis.conf`, `trigger_dispatch.sh`, and `requirements_celery.txt` belong to the previous Celery-based architecture and are kept for reference. Use the polling files above for new deployments.
+The previous Celery-based architecture (`rg_celery_app.py`, `rg_celery_coordinator.py`, `start_master.sh`, `start_worker.sh`, `docker-compose.yml`, `redis.conf`, `trigger_dispatch.sh`, `requirements_celery.txt`, `architecture.md`) has been removed from the repository. See git history for the legacy code.

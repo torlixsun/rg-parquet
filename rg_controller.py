@@ -206,16 +206,36 @@ def send_alert(title, message, level, tags):
 
 
 def run_comparison(target_month):
-    """Compare local ClickHouse vs Seagate S3 parquet row counts."""
+    """Compare local ClickHouse vs Seagate S3 parquet row counts.
+
+    Returns (all_ok, details).  On connection failure returns an error
+    detail list so the caller can record the failure and stop retrying.
+    """
     year = target_month[:4]
     tables = [t.format(m=target_month) for t in RG_TABLES]
 
-    local_client = clickhouse_driver.Client(host=CH_COMPARE_LOCAL_HOST)
-    cloud_client = clickhouse_driver.Client(
-        host=CH_COMPARE_CLOUD_HOST,
-        user=CH_COMPARE_CLOUD_USER,
-        password=CH_COMPARE_CLOUD_PASSWORD,
-    )
+    try:
+        local_client = clickhouse_driver.Client(
+            host=CH_COMPARE_LOCAL_HOST, connect_timeout=30
+        )
+    except Exception as exc:
+        print(f"[COMPARE] Failed to connect to local ClickHouse: {exc}")
+        return False, [
+            {"table": "__connect__", "local": "ERROR", "cloud": "-", "diff": str(exc)}
+        ]
+
+    try:
+        cloud_client = clickhouse_driver.Client(
+            host=CH_COMPARE_CLOUD_HOST,
+            user=CH_COMPARE_CLOUD_USER,
+            password=CH_COMPARE_CLOUD_PASSWORD,
+            connect_timeout=30,
+        )
+    except Exception as exc:
+        print(f"[COMPARE] Failed to connect to cloud ClickHouse: {exc}")
+        return False, [
+            {"table": "__connect__", "local": "OK", "cloud": "ERROR", "diff": str(exc)}
+        ]
 
     details = []
     all_ok = True
@@ -480,6 +500,20 @@ def update_table_status(task_id):
     if not table_name or not status:
         return jsonify({"error": "table_name and status required"}), 400
 
+    # Validate table_name against known patterns
+    valid_tables = {t.format(m="YYYYMM") for t in RG_TABLES}
+    normalized = re.sub(r"_\d{6}_", "_YYYYMM_", table_name)
+    if normalized not in valid_tables:
+        return (
+            jsonify(
+                {
+                    "error": f"Unknown table '{table_name}'. "
+                    f"Expected one of the 16 RG table patterns."
+                }
+            ),
+            400,
+        )
+
     db = get_db()
     task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
     if not task:
@@ -515,7 +549,6 @@ def reset_task(task_id):
         return auth_err
 
     db = get_db()
-    now = _now()
     db.execute(
         "UPDATE task_status SET status='new', started_at=NULL, completed_at=NULL, error_msg='' "
         "WHERE id=?",
@@ -600,12 +633,16 @@ def status():
     cycle_state = "idle"
     if tasks:
         statuses = [t["status"] for t in tasks]
-        if all(s in ("complete", "failed") for s in statuses):
+        if len(tasks) == 12 and all(
+            s in ("complete", "failed", "timeout") for s in statuses
+        ):
             cycle_state = "finalized" if finalize else "ready_for_finalize"
         elif any(s == "progress" for s in statuses):
             cycle_state = "running"
         elif any(s == "new" for s in statuses):
             cycle_state = "dispatched"
+        elif any(s == "timeout" for s in statuses):
+            cycle_state = "stalled"
 
     return jsonify(
         {
@@ -652,8 +689,16 @@ def manual_finalize(month):
 # ============================================================
 # Finalize logic
 # ============================================================
+_finalize_lock = threading.Lock()
+
+
 def do_finalize(target_month):
-    """Check all 12 tasks done → comparison → alert."""
+    """Check all 12 tasks done → comparison → alert.  Thread-safe."""
+    with _finalize_lock:
+        return _do_finalize_locked(target_month)
+
+
+def _do_finalize_locked(target_month):
     conn = _get_db_thread()
     try:
         # Check not already finalized
@@ -675,7 +720,7 @@ def do_finalize(target_month):
             return {"status": "not_all_created", "month": target_month}
 
         # Check all done
-        not_done = [t for t in tasks if t["status"] not in ("complete", "failed")]
+        not_done = [t for t in tasks if t["status"] not in ("complete", "failed", "timeout")]
         if not_done:
             return {
                 "status": "not_all_done",
@@ -783,7 +828,7 @@ def background_loop():
                     "SELECT status FROM task_status WHERE month=?", (m,)
                 ).fetchall()
                 if len(tasks) == 12 and all(
-                    t["status"] in ("complete", "failed") for t in tasks
+                    t["status"] in ("complete", "failed", "timeout") for t in tasks
                 ):
                     print(f"[BG] All 12 done for {m}, triggering finalize")
                     conn.close()
@@ -808,21 +853,22 @@ def background_loop():
                 ).fetchall()
                 for r in rows:
                     print(f"[BG] Timeout: task {r['id']} ({r['server']}) for {r['month']}")
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE task_status SET status='timeout', error_msg='Auto-timeout: started at "
                         + str(r["started_at"])
-                        + "' WHERE id=?",
+                        + "' WHERE id=? AND status='progress'",
                         (r["id"],),
                     )
-                    send_alert(
-                        "RG export task TIMEOUT",
-                        f"Server: {r['server']}\nMonth: {r['month']}\n"
-                        f"Started: {r['started_at']}\n"
-                        f"Exceeded {TASK_TIMEOUT_HOURS}h. Task marked as 'timeout'.\n"
-                        f"Use /api/tasks/{r['id']}/reset to retry.",
-                        "WARNING",
-                        ["rg-parquet", "export", "timeout"],
-                    )
+                    if cur.rowcount > 0:
+                        send_alert(
+                            "RG export task TIMEOUT",
+                            f"Server: {r['server']}\nMonth: {r['month']}\n"
+                            f"Started: {r['started_at']}\n"
+                            f"Exceeded {TASK_TIMEOUT_HOURS}h. Task marked as 'timeout'.\n"
+                            f"Use /api/tasks/{r['id']}/reset to retry.",
+                            "WARNING",
+                            ["rg-parquet", "export", "timeout"],
+                        )
                 conn.commit()
                 conn.close()
             except Exception as exc:
@@ -983,6 +1029,7 @@ table.tbl td.warn{color:var(--yellow)}
 <div class="footer">Last update: <span id="last-update">&mdash;</span></div>
 
 <script>
+const API_TOKEN = "___API_TOKEN___";
 const SERVERS=[...Array(12)].map((_,i)=>'lweb-rg-'+String(i+1).padStart(3,'0'));
 
 function pill(cls,txt){return `<span class="pill pill-${cls}">${txt}</span>`}
@@ -1011,7 +1058,8 @@ async function fetchStatus(){
       dispatched:['info','Waiting for workers to pick up'],
       running:['warn',`${inProg} in progress`],
       ready_for_finalize:['warn','All done, awaiting finalize'],
-      finalized: failed>0?['err',`${failed} servers failed`]:['ok','Validation complete']
+      finalized: failed>0?['err',`${failed} servers failed`]:['ok','Validation complete'],
+      stalled:['err','Tasks stuck — manual intervention needed']
     };
     const [cls,sub]=cycleMap[d.cycle_state]||['idle','—'];
     cycleEl.innerHTML=pill(cls,d.cycle_state||'—');
@@ -1119,7 +1167,7 @@ async function doDispatch(){
   const m=document.getElementById('dispatch-month').value.trim();
   if(!m){showMsg('Enter a month (YYYYMM)');return}
   try{
-    const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({month:m})});
+    const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json','X-API-Token':API_TOKEN},body:JSON.stringify({month:m})});
     const d=await r.json();
     if(d.created>0) showMsg(`Created ${d.created} tasks for ${m}`);
     else showMsg(`Tasks already exist for ${m}`);
@@ -1132,7 +1180,7 @@ async function doFinalize(){
   if(!m){showMsg('Enter a month (YYYYMM) to finalize');return}
   showMsg('Triggering finalize...');
   try{
-    const r=await fetch(`/api/finalize/${m}`,{method:'POST'});
+    const r=await fetch(`/api/finalize/${m}`,{method:'POST',headers:{'X-API-Token':API_TOKEN}});
     const d=await r.json();
     showMsg(`Finalize: ${d.status}`);
     fetchStatus();
@@ -1148,6 +1196,11 @@ setInterval(fetchStatus,30000);
 </html>"""
 
 
+@app.route("/dashboard")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML.replace("___API_TOKEN___", API_TOKEN))
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -1156,6 +1209,11 @@ if __name__ == "__main__":
     print(f"[Controller] DB: {DB_PATH}")
     print(f"[Controller] Port: {PORT}")
     print(f"[Controller] Timeout: {TASK_TIMEOUT_HOURS}h")
+    if not API_TOKEN:
+        print(
+            "[Controller] ** WARNING: API_TOKEN is not set — mutating endpoints are "
+            "UNPROTECTED. Set API_TOKEN in .env to enable authentication."
+        )
 
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()

@@ -39,6 +39,10 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/worker_$(date +%Y%m%d_%H%M%S).log"
 
+# Clean up logs older than 30 days
+find "$LOG_DIR" -name 'worker_*.log' -mtime +30 -delete 2>/dev/null || true
+find "$LOG_DIR" -name 'trigger_*.log' -mtime +30 -delete 2>/dev/null || true
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
 # ---- Check dependencies ----
@@ -47,18 +51,12 @@ for cmd in curl jq aws clickhouse-client; do
 done
 
 # ---- Prevent concurrent execution ----
-LOCK_FILE="/tmp/rg_worker_${SERVER_NAME}.lock"
-if [ -f "$LOCK_FILE" ]; then
-    PID=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-        log "Another worker instance is running (PID $PID), exiting."
-        exit 0
-    fi
-    log "Stale lock found, removing."
-    rm -f "$LOCK_FILE"
+LOCK_DIR="/tmp/rg_worker_${SERVER_NAME}.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log "Another worker instance is running (or stale lock), exiting."
+    exit 0
 fi
-echo $$ > "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE"' EXIT
+trap 'rmdir "$LOCK_DIR"' EXIT
 
 # ---- 16 table templates ----
 TABLES=(
@@ -82,7 +80,7 @@ TABLES=(
 
 # ---- Get ClickHouse user_files path ----
 USER_FILES_DIR=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
-    -q "SELECT value FROM system.settings WHERE name = 'user_files_path'" 2>/dev/null | head -1 | tr -d '\n')
+    -q "SELECT value FROM system.settings WHERE name = 'user_files_path'" 2>/dev/null | head -1 | tr -d '\n' || true)
 USER_FILES_DIR="${USER_FILES_DIR:-/var/lib/clickhouse/user_files}"
 USER_FILES_DIR="${USER_FILES_DIR%/}"
 log "ClickHouse user_files_path: ${USER_FILES_DIR}"
@@ -246,16 +244,22 @@ done
 # ============================================================
 if [ $FAILED_TABLES -eq 0 ]; then
     log "All 16 tables exported successfully"
-    curl -sf -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
         -H "Content-Type: application/json" \
         -H "X-API-Token: ${API_TOKEN}" \
-        -d "{\"status\": \"complete\", \"server\": \"${SERVER_NAME}\"}" >/dev/null 2>&1 || true
+        -d "{\"status\": \"complete\", \"server\": \"${SERVER_NAME}\"}" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ]; then
+        log "  WARNING: Final complete PATCH returned HTTP ${HTTP_CODE} — task may hang in 'progress'"
+    fi
 else
     log "Task completed with ${FAILED_TABLES} failed tables"
-    curl -sf -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
         -H "Content-Type: application/json" \
         -H "X-API-Token: ${API_TOKEN}" \
-        -d "{\"status\": \"failed\", \"server\": \"${SERVER_NAME}\", \"error_msg\": \"${FAILED_TABLES} tables failed\"}" >/dev/null 2>&1 || true
+        -d "{\"status\": \"failed\", \"server\": \"${SERVER_NAME}\", \"error_msg\": \"${FAILED_TABLES} tables failed\"}" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" -ge 400 ] 2>/dev/null || [ "$HTTP_CODE" = "000" ]; then
+        log "  WARNING: Final failed PATCH returned HTTP ${HTTP_CODE} — task may hang in 'progress'"
+    fi
 fi
 
 log "Worker done."

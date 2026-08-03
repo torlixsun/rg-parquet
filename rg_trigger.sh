@@ -25,6 +25,9 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/trigger_$(date +%Y%m%d_%H%M%S).log"
 
+# Clean up logs older than 30 days
+find "$LOG_DIR" -name 'trigger_*.log' -mtime +30 -delete 2>/dev/null || true
+
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
 # Calculate target month (last month)
