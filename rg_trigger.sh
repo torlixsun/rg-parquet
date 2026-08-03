@@ -7,7 +7,8 @@
 #   crontab -e
 #   30 1 * * * /path/to/rg_trigger.sh
 #
-# Idempotent — controller skips if tasks already exist for the month.
+# Readiness gate: queries MySQL solr_info and only dispatches the target
+# month once US_D / US_M / INTL_D / INTL_M all have solr_month == target.
 # ============================================================
 set -euo pipefail
 
@@ -21,6 +22,13 @@ fi
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:5000}"
 API_TOKEN="${API_TOKEN:-}"
 
+# MySQL — readiness check (deploy on the MySQL host or with access to it)
+MYSQL_HOST="${MYSQL_HOST:-127.0.0.1}"
+MYSQL_PORT="${MYSQL_PORT:-3306}"
+MYSQL_USER="${MYSQL_USER:-root}"
+MYSQL_PASSWORD="${MYSQL_PASSWORD:-}"
+MYSQL_DATABASE="${MYSQL_DATABASE:-actonia}"
+
 # Logging
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR"
@@ -31,11 +39,42 @@ find "$LOG_DIR" -name 'trigger_*.log' -mtime +30 -delete 2>/dev/null || true
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
 
-# Calculate target month (last month)
+# ---- Calculate target month (last month) ----
 TARGET_MONTH=$(date +%Y%m -d "$(date +%Y-%m-01) - 1 month")
-log "Trigger dispatching for month: ${TARGET_MONTH}"
+log "Target month: ${TARGET_MONTH}"
 
-# POST to controller (idempotent — returns existing if already created)
+# ---- Readiness check: MySQL solr_info ----
+command -v mysql >/dev/null 2>&1 || {
+    log "ERROR: mysql client not installed"
+    exit 1
+}
+
+rows=$(mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
+    -D "${MYSQL_DATABASE}" -N -B -e \
+    "SELECT country_code FROM solr_info
+     WHERE solr_type = 19 AND solr_month = '${TARGET_MONTH}'" 2>>"$LOG_FILE") || {
+    log "ERROR: MySQL query failed (host=${MYSQL_HOST} db=${MYSQL_DATABASE})"
+    exit 1
+}
+
+expected=("US_D" "US_M" "INTL_D" "INTL_M")
+ready=true
+for code in "${expected[@]}"; do
+    if grep -qx "$code" <<< "$rows"; then
+        log "  ${code}: ready"
+    else
+        log "  ${code}: MISSING"
+        ready=false
+    fi
+done
+
+if [ "$ready" = false ]; then
+    log "Not ready — some entries not at ${TARGET_MONTH} yet, skipping dispatch"
+    exit 0
+fi
+log "All 4 entries ready for ${TARGET_MONTH}, dispatching"
+
+# ---- POST to controller (idempotent — returns existing if already created) ----
 RESPONSE=$(curl -sf -X POST "${CONTROLLER_URL}/api/tasks" \
     -H "Content-Type: application/json" \
     -H "X-API-Token: ${API_TOKEN}" \

@@ -9,10 +9,10 @@ Exports 16 ClickHouse tables per server (× 12 servers `lweb-rg-001` ~ `012`) to
 ## Architecture
 
 ```
-┌──────────────┐   daily cron (01:30, idempotent) ┌────────────────────────────┐
-│  b80 trigger │ ─── POST /api/tasks ────────▶ │         Controller           │
-│ rg_trigger.sh│        (idempotent)           │  Flask API + SQLite          │
-└──────────────┘                               │  rg_export.db                │
+┌──────────────┐   daily cron (01:30)          ┌────────────────────────────┐
+│  b80 trigger │ ── MySQL solr_info ready? ──▶ │         Controller           │
+│ rg_trigger.sh│   └ yes → POST /api/tasks     │  Flask API + SQLite          │
+└──────────────┘        (idempotent)           │  rg_export.db                │
                                                │  state machine + finalize    │
                                                │  + dashboard at /dashboard   │
                                                └──────────────┬───────────────┘
@@ -49,7 +49,7 @@ new ──▶ progress ──▶ complete
           └────────▶ timeout (48h, needs manual /api/tasks/<id>/reset)
 ```
 
-- **Trigger** (`rg_trigger.sh`): daily cron, creates tasks for last month. Idempotent — if tasks exist, the controller returns them instead of duplicating, so a missed or failed run retries the next day.
+- **Trigger** (`rg_trigger.sh`): daily cron. Before dispatching, it queries MySQL `solr_info` and only creates tasks for the target month once `US_D` / `US_M` / `INTL_D` / `INTL_M` all have `solr_month == target`. Idempotent — if tasks already exist, the controller returns them instead of duplicating, so a missed or failed run retries the next day.
 - **Controller** (`rg_controller.py`): serves the API, auto-finalizes when all 12 tasks are done, compares local ClickHouse vs Seagate S3 row counts, alerts on success/mismatch/failure, and marks long-running tasks as `timeout` after `TASK_TIMEOUT_HOURS`.
 - **Worker** (`rg_worker.sh`): cron every 5 min on each server. Heartbeat → poll for its own `new` task → atomically claim (`WHERE status='new'`) → export 16 tables to Parquet (`FUNCTION file()`, zstd) → upload to Seagate (5× retry) → validate row counts → report per-table status → mark task complete/failed.
 
@@ -123,6 +123,8 @@ Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
 The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012`).
 
 ### 5. Deploy Trigger (b80)
+
+Requires the `mysql` client and access to MySQL (`MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` in `.env`). The script skips dispatch until the readiness check passes, so it can run daily.
 
 ```bash
 30 1 * * * /path/to/rg_trigger.sh >> /var/log/rg_trigger.log 2>&1
