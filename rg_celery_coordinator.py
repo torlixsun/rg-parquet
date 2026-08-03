@@ -1,4 +1,8 @@
 """
+DEPRECATED — Legacy Celery architecture. Replaced by the polling architecture:
+see rg_controller.py (controller) + rg_worker.sh (workers) + rg_trigger.sh (trigger).
+Kept for reference only.
+
 RG Export Coordinator — Flask API + Dispatch Trigger
 =====================================================
 Thin status API. The real orchestration is done by Celery workers.

@@ -1,163 +1,141 @@
 # RG Export Orchestrator
 
-Celery-based distributed export pipeline for ResearchGrid (RG) monthly ranking data.
+Polling-based distributed export pipeline for ResearchGrid (RG) monthly ranking data.
 
-Exports 16 ClickHouse tables to Parquet → uploads to Seagate S3 → validates row counts → cross-checks all 12 servers.
+Exports 16 ClickHouse tables per server (× 12 servers `lweb-rg-001` ~ `012`) to Parquet → uploads to Seagate S3 → validates row counts → cross-checks local vs cloud → sends alerts.
+
+> **Architecture**: Flask + SQLite controller with worker cron scripts. No Celery, no Redis.
+> `architecture.md` describes the *legacy* Celery+Redis design and is kept for reference only.
 
 ## Architecture
 
 ```
-┌───────────────────┐
-│  MySQL Server     │  crontab runs trigger_dispatch.sh
-│  (solr_info)      │  every 10 min, checks solr_info
-└────────┬──────────┘  → POST /api/dispatch?month=YYYYMM when ready
-         │
-         ▼
-┌─────────────────────────────────────────────┐
-│              Coordinator                    │
-│  Flask API (dispatch/stats)                 │
-│  Celery Worker (-Q coordinator)             │
-│  .dispatch_state.json (idempotency)         │
-└──────────┬──────────┬───────────────────────┘
-           │          │
-           ▼          ▼ (via Redis broker)
-┌─────────────────────────────────────────────┐
-│              Celery Chord                   │
-│   group(12 × export_all_tables)             │
-│          | finalize_export                  │
-│          |   (comparison + alert)            │
-└──────┬──────────────────────────────────────┘
-       │
-       ▼
-┌──────────────┐        ┌──────────────┐
-│ Worker 001   │  ...   │ Worker 012   │
-│ Q: lweb-001  │        │ Q: lweb-012  │
-│              │        │              │
-│ export 16    │        │ export 16    │
-│ tables →     │        │ tables →     │
-│ Parquet →    │        │ Parquet →    │
-│ Seagate →    │        │ Seagate →    │
-│ validate     │        │ validate     │
-└──────────────┘        └──────────────┘
+┌──────────────┐   monthly cron (1st, 01:00)   ┌──────────────────────────────┐
+│  b80 trigger │ ─── POST /api/tasks ────────▶ │         Controller           │
+│ rg_trigger.sh│        (idempotent)           │  Flask API + SQLite          │
+└──────────────┘                               │  rg_export.db                │
+                                               │  state machine + finalize    │
+                                               │  + dashboard at /dashboard   │
+                                               └──────────────┬───────────────┘
+        ┌──────────────────────────────────────────────────────┼───────────────────────────┐
+        │  workers poll /api/tasks?server=<me>&status=new every 5 min                       │
+        ▼              ▼              ▼                       ▼              ▼              ▼
+┌─────────────┐ ┌─────────────┐ ┌─────────────┐        ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
+│ lweb-rg-001 │ │ lweb-rg-002 │ │ lweb-rg-003 │   ...  │ lweb-rg-011 │ │ lweb-rg-012 │ │ ...         │
+│ rg_worker.sh│ │             │ │             │        │             │ │             │ │             │
+│ export 16   │ │ export 16   │ │ export 16   │        │ export 16   │ │ export 16   │ │             │
+│ tables→S3   │ │ tables→S3   │ │ tables→S3   │        │ tables→S3   │ │ tables→S3   │ │             │
+└──────┬──────┘ └──────┬──────┘ └──────┬──────┘        └──────┬──────┘ └──────┬──────┘ └─────────────┘
+       │               │               │                     │               │
+       └───────────────┴───────┬───────┴─────────────────────┴───────────────┘
+                               ▼
+                 ┌──────────────────────────┐
+                 │       Seagate S3         │
+                 │ s3://rg-datalake-{year}/ │
+                 │  {table}/{server}.parquet│
+                 └──────────────────────────┘
+                               ▲
+         all 12 done ──▶ controller auto-finalize (background thread)
+                               │
+                 comparison: local CH vs S3 via s3()  ──▶ alert
 ```
 
-## Anti-duplication (3 layers)
+## Task lifecycle
 
-| Layer | Mechanism | Scope |
-|-------|-----------|-------|
-| Trigger script | `/tmp/rg_trigger_state.txt` tracks last triggered month | Per MySQL server |
-| Coordinator API | Rejects if `dispatched_month == target_month` before even queuing | Global |
-| Celery task | `.dispatch_state.json` + idempotency guard in `dispatch_export` | Global |
-| Worker per-table | `aws s3 ls` check — skips if parquet already on Seagate | Per table |
+Each month creates 12 tasks (one per server), tracked in SQLite:
+
+```
+new ──▶ progress ──▶ complete
+          │  └─────▶ failed
+          └────────▶ timeout (48h, needs manual /api/tasks/<id>/reset)
+```
+
+- **Trigger** (`rg_trigger.sh`): monthly cron, creates tasks for last month. Idempotent — if tasks exist, the controller returns them instead of duplicating.
+- **Controller** (`rg_controller.py`): serves the API, auto-finalizes when all 12 tasks are done, compares local ClickHouse vs Seagate S3 row counts, alerts on success/mismatch/failure, and marks long-running tasks as `timeout` after `TASK_TIMEOUT_HOURS`.
+- **Worker** (`rg_worker.sh`): cron every 5 min on each server. Heartbeat → poll for its own `new` task → atomically claim (`WHERE status='new'`) → export 16 tables to Parquet (`FUNCTION file()`, zstd) → upload to Seagate (5× retry) → validate row counts → report per-table status → mark task complete/failed.
+
+## Anti-duplication
+
+| Layer | Mechanism |
+|-------|-----------|
+| Controller | `UNIQUE(month, server)` — tasks for a month are created exactly once |
+| Worker | Skips tables already present on Seagate (`aws s3 ls`) |
+| Trigger | Re-POSTing an existing month returns the existing tasks |
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.10+
-- Redis (Celery broker/backend)
-- ClickHouse on each worker (for querying source tables)
-- AWS CLI with `seagate` profile (on each worker)
+Prerequisites: Python 3.10+, ClickHouse on each worker, AWS CLI with the `seagate` profile on each worker, `jq` on workers.
 
 ### 1. Configure
 
 ```bash
 cp .env.example .env
-# Edit .env with your credentials
+# Fill in real values: API_TOKEN, ClickHouse passwords, Seagate credentials, CONTROLLER_URL
 ```
 
-### 2. Install
+`API_TOKEN` must be identical on the controller and all workers/trigger — the controller rejects mutating API calls without a matching `X-API-Token` header.
+
+### 2. Start Controller (1 machine)
 
 ```bash
-pip3 install -r requirements_celery.txt --break-system-packages
+./start_controller.sh
+# Dashboard: http://<controller-ip>:5000/dashboard
 ```
 
-### 3. Start Coordinator (1 machine)
+### 3. Deploy Workers (12 machines)
+
+Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
 
 ```bash
-./start_master.sh
+*/5 * * * * /path/to/rg_worker.sh >> /var/log/rg_worker.log 2>&1
 ```
 
-Runs Celery Worker (`-Q coordinator`) + Flask API on port 5000.
+The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012`).
 
-### 4. Start Workers (12 machines)
+### 4. Deploy Trigger (b80)
 
 ```bash
-./start_worker.sh lweb-rg-001   # on server 1
-./start_worker.sh lweb-rg-002   # on server 2
-# ... etc through lweb-rg-012
+0 1 1 * * /path/to/rg_trigger.sh >> /var/log/rg_trigger.log 2>&1
 ```
 
-### 5. Deploy Trigger Script (MySQL server)
+## API Endpoints
 
-```bash
-cp trigger_dispatch.sh /usr/local/bin/
-chmod +x /usr/local/bin/trigger_dispatch.sh
-```
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/api/ping` | GET | no | Health check |
+| `/api/status` | GET | no | Month, cycle state, tasks, workers, finalize result |
+| `/api/workers` | GET | no | Worker heartbeats with online status |
+| `/api/tasks` | POST | yes | Create 12 tasks for a month (idempotent) |
+| `/api/tasks` | GET | no | List tasks (`?month=&server=&status=`) |
+| `/api/tasks/<id>` | GET | no | Task detail |
+| `/api/tasks/<id>` | PATCH | yes | Claim (`progress`) / complete / failed — server must match task |
+| `/api/tasks/<id>/tables` | GET | no | Per-table statuses |
+| `/api/tasks/<id>/tables` | POST | yes | Report a table's export/validation result |
+| `/api/tasks/<id>/reset` | POST | yes | Reset a task to `new` (retry after timeout/failure) |
+| `/api/finalize/<month>` | POST | yes | Manually trigger finalize/comparison |
 
-Configure environment variables in the script or via export:
-
-```bash
-export MYSQL_HOST=127.0.0.1
-export MYSQL_USER=root
-export MYSQL_PASSWORD=your_password
-export COORDINATOR_URL=http://<coordinator-ip>:5000
-```
-
-Add crontab (every 10 minutes):
-
-```bash
-*/10 * * * * /usr/local/bin/trigger_dispatch.sh >> /var/log/rg_trigger.log 2>&1
-```
-
-## How It Works
-
-1. **MySQL server**: `trigger_dispatch.sh` queries `solr_info` every 10 min
-2. When 4 rows (`US_D`, `US_M`, `INTL_D`, `INTL_M`) all have `solr_month == current YYYYMM`, calls `POST /api/dispatch?month=YYYYMM`
-3. **Coordinator** validates the request (idempotency check) then queues a Celery **chord**:
-   - 12 parallel `export_all_tables` tasks (one per server queue)
-   - Chord callback `finalize_export` (comparison + alert)
-4. Each **Worker**:
-   - Checks if table already on Seagate (`aws s3 ls`) → skip if exists
-   - Exports table to Parquet via `clickhouse-client` + `FUNCTION file()`
-   - Uploads Parquet to Seagate S3 (`rg-datalake-{year}/{table}/`)
-   - Validates row counts (local vs exported)
-   - Cleans up local files
-5. When all 12 complete, **chord callback** (`finalize_export`):
-   - Queries local ClickHouse vs Seagate S3 row counts
-   - Compares all 16 tables
-   - Sends alert (success or mismatch)
-   - Marks cycle as completed
-
-## API Endpoints (Coordinator)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/ping` | GET | Health check |
-| `/api/status` | GET | Dispatch state + worker stats |
-| `/api/dispatch?month=YYYYMM` | POST | Trigger export for a month (idempotent) |
-| `/api/reset` | POST | Reset dispatch state (emergency re-run) |
-
-## Monthly Reset
-
-No manual action needed. When `trigger_dispatch.sh` sees a new month in MySQL, it calls the coordinator. The coordinator's `.dispatch_state.json` detects the new month and allows dispatch. The trigger script's local state file also auto-rolls.
+Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay open so the dashboard works in the browser.
 
 ## Safety
 
-- **No MySQL or ClickHouse writes** — Export uses `FUNCTION file()` to write Parquet to local filesystem only, not ClickHouse tables. Comparison is SELECT-only.
-- **Idempotent** — Same month cannot be dispatched twice. Workers skip already-uploaded tables.
-- Long-running tasks supported (no time limits, 48h visibility timeout).
+- **No MySQL or ClickHouse writes** — export uses `FUNCTION file()` to write Parquet to local disk only; comparison is SELECT-only.
+- **Idempotent** — a month's tasks are created once; workers skip tables already on Seagate.
+- **Retries** — 5× retry on export and upload; per-table row-count validation before marking complete.
+- **Timeouts** — tasks stuck in `progress` for 48h are flagged `timeout` and must be reset manually.
 
 ## Files
 
 ```
-.
-├── .env.example              # Config template
-├── .gitignore
-├── requirements_celery.txt    # Python dependencies
-├── rg_celery_app.py          # Celery app, tasks, chord logic
-├── rg_celery_coordinator.py  # Flask API + dispatch endpoint
-├── start_master.sh           # Coordinator startup
-├── start_worker.sh           # Worker startup
-└── trigger_dispatch.sh       # MySQL-side trigger script
+├── .env.example              # Config template (placeholders — never commit real secrets)
+├── requirements_polling.txt  # Controller dependencies
+├── rg_controller.py          # Flask API + SQLite + background finalize/timeout thread + dashboard
+├── rg_worker.sh              # Worker poll/claim/export/upload script (cron on each server)
+├── rg_trigger.sh             # Monthly trigger script (cron on b80)
+├── start_controller.sh       # Controller startup
+├── README.md                 # This file
+└── architecture.md           # LEGACY Celery+Redis design doc (reference only)
 ```
+
+## Legacy (Celery + Redis)
+
+`rg_celery_app.py`, `rg_celery_coordinator.py`, `start_master.sh`, `start_worker.sh`, `docker-compose.yml`, `redis.conf`, `trigger_dispatch.sh`, and `requirements_celery.txt` belong to the previous Celery-based architecture and are kept for reference. Use the polling files above for new deployments.

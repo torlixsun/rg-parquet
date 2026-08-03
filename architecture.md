@@ -1,5 +1,10 @@
 # RG Export Architecture
 
+> **NOTE (2026-08):** This document describes the **legacy Celery + Redis** architecture.
+> The current implementation is the **polling architecture**: Flask + SQLite controller
+> (`rg_controller.py`) with cron worker scripts (`rg_worker.sh`) and monthly trigger
+> (`rg_trigger.sh`). See [README.md](README.md) for the current design.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          db80 (MySQL)                               │

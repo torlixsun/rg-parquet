@@ -1,4 +1,8 @@
 """
+DEPRECATED — Legacy Celery architecture. Replaced by the polling architecture:
+see rg_controller.py (controller) + rg_worker.sh (workers) + rg_trigger.sh (trigger).
+Kept for reference only.
+
 RG Export — Celery Application
 ===============================
 - Dispatch: triggered externally via /api/dispatch?month=YYYYMM (by MySQL trigger script)
@@ -39,7 +43,7 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 # Worker ClickHouse
 CH_LOCAL_HOST = os.environ.get("CH_LOCAL_HOST", "127.0.0.1")
-CH_LOCAL_PASSWORD = os.environ.get("CH_LOCAL_PASSWORD", "clarity99!")
+CH_LOCAL_PASSWORD = os.environ.get("CH_LOCAL_PASSWORD", "")
 CH_LOCAL_DB = os.environ.get("CH_LOCAL_DB", "monthly_ranking")
 
 # Comparison ClickHouse
@@ -47,7 +51,7 @@ CH_COMPARE_LOCAL_HOST = os.environ.get("CH_COMPARE_LOCAL_HOST", "23.105.14.193")
 CH_COMPARE_LOCAL_DB = os.environ.get("CH_COMPARE_LOCAL_DB", "monthly_ranking")
 CH_COMPARE_CLOUD_HOST = os.environ.get("CH_COMPARE_CLOUD_HOST", "173.236.65.154")
 CH_COMPARE_CLOUD_USER = os.environ.get("CH_COMPARE_CLOUD_USER", "default")
-CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "clarity99!")
+CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "")
 
 # Alert
 ALERT_URL = os.environ.get("ALERT_URL", "http://69.175.99.218:8090/api/v1/alert")

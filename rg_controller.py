@@ -11,7 +11,9 @@ Deploy on tools-1:
 """
 
 import json
+import hmac
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -32,12 +34,15 @@ PORT = int(os.environ.get("PORT", 5000))
 DB_PATH = os.path.join(SCRIPT_DIR, "rg_export.db")
 TASK_TIMEOUT_HOURS = int(os.environ.get("TASK_TIMEOUT_HOURS", 48))
 
+# Shared secret for API auth (mutating endpoints). Set a real value in .env!
+API_TOKEN = os.environ.get("API_TOKEN", "")
+
 # ClickHouse — cross-validation
 CH_COMPARE_LOCAL_HOST = os.environ.get("CH_COMPARE_LOCAL_HOST", "23.105.14.193")
 CH_COMPARE_LOCAL_DB = os.environ.get("CH_COMPARE_LOCAL_DB", "monthly_ranking")
 CH_COMPARE_CLOUD_HOST = os.environ.get("CH_COMPARE_CLOUD_HOST", "173.236.65.154")
 CH_COMPARE_CLOUD_USER = os.environ.get("CH_COMPARE_CLOUD_USER", "default")
-CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "clarity99!")
+CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "")
 
 # Alert
 ALERT_URL = os.environ.get("ALERT_URL", "http://69.175.99.218:8090/api/v1/alert")
@@ -78,6 +83,9 @@ RG_TABLES = [
 # ============================================================
 # SQLite
 # ============================================================
+app = Flask(__name__)
+
+
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
@@ -163,6 +171,21 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _valid_month(month):
+    """Accept a real YYYYMM month (e.g. 202608), reject nonsense like 999999."""
+    return bool(re.fullmatch(r"(19|20)\d{2}(0[1-9]|1[0-2])", month or ""))
+
+
+def _check_auth():
+    """Require X-API-Token on mutating endpoints when API_TOKEN is configured."""
+    if not API_TOKEN:
+        return None
+    token = request.headers.get("X-API-Token", "")
+    if not hmac.compare_digest(token, API_TOKEN):
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
 def send_alert(title, message, level, tags):
     try:
         requests.post(
@@ -238,11 +261,8 @@ def run_comparison(target_month):
 
 
 # ============================================================
-# Flask App
+# Flask Routes
 # ============================================================
-app = Flask(__name__)
-
-
 @app.route("/api/ping")
 def ping():
     return jsonify({"status": "ok", "timestamp": _now()})
@@ -260,8 +280,12 @@ def create_tasks():
     data = request.get_json(silent=True) or {}
     month = data.get("month", "").strip()
 
-    if not month or len(month) != 6 or not month.isdigit():
-        return jsonify({"error": "Invalid 'month'. Use YYYYMM."}), 400
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    if not _valid_month(month):
+        return jsonify({"error": "Invalid 'month'. Use a real YYYYMM (e.g. 202608)."}), 400
 
     db = get_db()
 
@@ -279,14 +303,28 @@ def create_tasks():
             }
         )
 
-    # Create 12 tasks
+    # Create 12 tasks (handle concurrent creation races via UNIQUE(month, server))
     now = _now()
-    for server in RG_SERVERS:
-        db.execute(
-            "INSERT INTO task_status (month, server, status, created_at) VALUES (?, ?, 'new', ?)",
-            (month, server, now),
+    try:
+        for server in RG_SERVERS:
+            db.execute(
+                "INSERT INTO task_status (month, server, status, created_at) VALUES (?, ?, 'new', ?)",
+                (month, server, now),
+            )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        existing = db.execute(
+            "SELECT * FROM task_status WHERE month=? ORDER BY server", (month,)
+        ).fetchall()
+        return jsonify(
+            {
+                "month": month,
+                "created": 0,
+                "message": "Tasks already exist (concurrent creation)",
+                "tasks": [dict(r) for r in existing],
+            }
         )
-    db.commit()
 
     tasks = db.execute(
         "SELECT * FROM task_status WHERE month=? ORDER BY server", (month,)
@@ -346,6 +384,10 @@ def update_task(task_id):
     - status='complete'/'failed': update (WHERE status='progress')
     Body: {"status": "progress", "server": "lweb-rg-001"}
     """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
     data = request.get_json(silent=True) or {}
     new_status = data.get("status", "").strip()
     server = data.get("server", "").strip()
@@ -357,6 +399,20 @@ def update_task(task_id):
     db = get_db()
     now = _now()
 
+    # A task can only be claimed/updated by its own server.
+    task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+    if not server:
+        return jsonify({"error": "server is required"}), 400
+    if server != task["server"]:
+        return jsonify(
+            {
+                "updated": False,
+                "message": f"Server mismatch: task {task_id} belongs to {task['server']}, not {server}",
+            }
+        )
+
     if new_status == "progress":
         # Atomic claim — only succeeds if current status is 'new'
         cur = db.execute(
@@ -367,8 +423,6 @@ def update_task(task_id):
         db.commit()
         if cur.rowcount == 0:
             return jsonify({"claimed": False, "message": "Task not in 'new' state"})
-
-        task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
 
         # Create table_status entries if not exist
         month = task["month"]
@@ -412,6 +466,10 @@ def update_table_status(task_id):
     Update table-level status.
     Body: {"table_name": "...", "status": "complete", "rows_local": 123, "rows_s3": 123, "error_msg": ""}
     """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
     data = request.get_json(silent=True) or {}
     table_name = data.get("table_name", "")
     status = data.get("status", "")
@@ -423,6 +481,9 @@ def update_table_status(task_id):
         return jsonify({"error": "table_name and status required"}), 400
 
     db = get_db()
+    task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
     now = _now()
     db.execute(
         "INSERT INTO task_table_status (task_id, table_name, status, rows_local, rows_s3, error_msg, updated_at) "
@@ -449,6 +510,10 @@ def get_table_statuses(task_id):
 @app.route("/api/tasks/<int:task_id>/reset", methods=["POST"])
 def reset_task(task_id):
     """Reset task to 'new' (for retry after failure/timeout)."""
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
     db = get_db()
     now = _now()
     db.execute(
@@ -469,6 +534,10 @@ def reset_task(task_id):
 
 @app.route("/api/heartbeat", methods=["POST"])
 def heartbeat():
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
     data = request.get_json(silent=True) or {}
     server = data.get("server", "")
     hostname = data.get("hostname", "")
@@ -569,6 +638,13 @@ def workers():
 @app.route("/api/finalize/<month>", methods=["POST"])
 def manual_finalize(month):
     """Manually trigger finalize for a month."""
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    if not _valid_month(month):
+        return jsonify({"error": "Invalid month. Use YYYYMM (e.g. 202608)."}), 400
+
     result = do_finalize(month)
     return jsonify(result)
 

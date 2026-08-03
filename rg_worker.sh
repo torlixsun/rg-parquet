@@ -28,10 +28,11 @@ fi
 
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:5000}"
 SERVER_NAME=$(hostname -s)
-CH_LOCAL_PASSWORD="${CH_LOCAL_PASSWORD:-clarity99!}"
+CH_LOCAL_PASSWORD="${CH_LOCAL_PASSWORD:-}"
 CH_LOCAL_DB="${CH_LOCAL_DB:-monthly_ranking}"
 AWS_PROFILE="${AWS_PROFILE:-seagate}"
 SEAGATE_ENDPOINT="${SEAGATE_ENDPOINT:-https://s3.us-east-1.clarity1.lyve.seagate.com}"
+API_TOKEN="${API_TOKEN:-}"
 
 # Logging
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -92,6 +93,7 @@ log "ClickHouse user_files_path: ${USER_FILES_DIR}"
 MY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
 curl -sf -X POST "${CONTROLLER_URL}/api/heartbeat" \
     -H "Content-Type: application/json" \
+    -H "X-API-Token: ${API_TOKEN}" \
     -d "{\"server\": \"${SERVER_NAME}\", \"hostname\": \"$(hostname)\", \"ip\": \"${MY_IP}\"}" \
     >/dev/null 2>&1 || true
 
@@ -113,6 +115,7 @@ log "Found new task: ${TASK_ID}"
 # ============================================================
 CLAIM_JSON=$(curl -sf -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
     -H "Content-Type: application/json" \
+    -H "X-API-Token: ${API_TOKEN}" \
     -d "{\"status\": \"progress\", \"server\": \"${SERVER_NAME}\"}" 2>/dev/null || echo '{"claimed":false}')
 
 CLAIMED=$(echo "$CLAIM_JSON" | jq -r '.claimed // false' 2>/dev/null)
@@ -140,12 +143,13 @@ for template in "${TABLES[@]}"; do
     log "Processing ${TABLE_NAME}..."
 
     # ---- Idempotency: skip if already on Seagate ----
-    if aws s3 ls "$S3_PATH" --profile "${AWS_PROFILE}" --endpoint-url "${SEAGATE_ENDPOINT}" 2>/dev/null | grep -q ".parquet"; then
+    if aws s3 ls "$S3_PATH" --profile "${AWS_PROFILE}" --endpoint-url "${SEAGATE_ENDPOINT}" 2>/dev/null | grep -qF ".parquet"; then
         log "  Already on Seagate, skipping"
         LOCAL_COUNT=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
             -q "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}" 2>/dev/null | tr -d '\n' || echo 0)
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
+            -H "X-API-Token: ${API_TOKEN}" \
             -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"skipped\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${LOCAL_COUNT}}" \
             >/dev/null 2>&1 || true
         continue
@@ -175,6 +179,7 @@ for template in "${TABLES[@]}"; do
         log "  Export FAILED after 5 retries"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
+            -H "X-API-Token: ${API_TOKEN}" \
             -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"error_msg\": \"export failed after 5 retries\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
@@ -199,6 +204,7 @@ for template in "${TABLES[@]}"; do
         log "  Upload FAILED after 5 retries"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
+            -H "X-API-Token: ${API_TOKEN}" \
             -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"error_msg\": \"upload failed after 5 retries\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
@@ -217,12 +223,14 @@ for template in "${TABLES[@]}"; do
         log "  Validation OK: ${LOCAL_COUNT} rows"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
+            -H "X-API-Token: ${API_TOKEN}" \
             -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"complete\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${EXPORT_COUNT}}" \
             >/dev/null 2>&1 || true
     else
         log "  Validation MISMATCH: local=${LOCAL_COUNT} export=${EXPORT_COUNT}"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
+            -H "X-API-Token: ${API_TOKEN}" \
             -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${EXPORT_COUNT}, \"error_msg\": \"row count mismatch\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
@@ -240,12 +248,14 @@ if [ $FAILED_TABLES -eq 0 ]; then
     log "All 16 tables exported successfully"
     curl -sf -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
         -H "Content-Type: application/json" \
-        -d '{"status": "complete"}' >/dev/null 2>&1 || true
+        -H "X-API-Token: ${API_TOKEN}" \
+        -d "{\"status\": \"complete\", \"server\": \"${SERVER_NAME}\"}" >/dev/null 2>&1 || true
 else
     log "Task completed with ${FAILED_TABLES} failed tables"
     curl -sf -X PATCH "${CONTROLLER_URL}/api/tasks/${TASK_ID}" \
         -H "Content-Type: application/json" \
-        -d "{\"status\": \"failed\", \"error_msg\": \"${FAILED_TABLES} tables failed\"}" >/dev/null 2>&1 || true
+        -H "X-API-Token: ${API_TOKEN}" \
+        -d "{\"status\": \"failed\", \"server\": \"${SERVER_NAME}\", \"error_msg\": \"${FAILED_TABLES} tables failed\"}" >/dev/null 2>&1 || true
 fi
 
 log "Worker done."
