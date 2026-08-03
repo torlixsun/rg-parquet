@@ -23,7 +23,13 @@ fi
 echo $$ > "$PID_FILE"
 trap 'rm -f "$PID_FILE"' EXIT
 
-# Install dependencies
+# Install dependencies (prefer uv, fall back to pip3)
+if command -v uv >/dev/null 2>&1; then
+    echo "  Dependency manager: uv"
+    uv sync --quiet 2>/dev/null || true
+    exec uv run python rg_controller.py
+fi
+echo "  Dependency manager: pip3"
 pip3 install -r requirements_polling.txt --break-system-packages --quiet 2>/dev/null || true
 
 # Read config from .env

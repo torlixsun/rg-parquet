@@ -1,0 +1,20 @@
+[project]
+name = "rg-parquet"
+version = "1.0.0"
+description = "RG export orchestrator: distributed ClickHouse-to-Parquet export pipeline (Flask + SQLite polling architecture)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0,<4.0",
+    "requests>=2.28",
+    "clickhouse-driver>=0.2.5",
+    "python-dotenv>=1.0",
+]
+
+[tool.uv]
+# This repo is a collection of scripts, not a Python package: install the
+# dependencies into .venv without building/installing the project itself.
+package = false
+
+# Generate / refresh the lock file with:
+#   uv lock

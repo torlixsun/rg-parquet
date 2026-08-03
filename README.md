@@ -81,6 +81,19 @@ cp .env.example .env
 # Dashboard: http://<controller-ip>:5000/dashboard
 ```
 
+`start_controller.sh` uses **uv** automatically when it is installed (recommended), and falls back to `pip3` otherwise:
+
+```bash
+# With uv (recommended)
+uv sync               # create .venv and install dependencies
+uv lock               # generate / refresh uv.lock (first run, or after dependency changes)
+./start_controller.sh # or: uv run python rg_controller.py
+
+# Without uv
+pip3 install -r requirements_polling.txt --break-system-packages
+python3 rg_controller.py
+```
+
 ### 3. Deploy Workers (12 machines)
 
 Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
@@ -127,6 +140,7 @@ Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay
 
 ```
 ├── .env.example              # Config template (placeholders — never commit real secrets)
+├── pyproject.toml            # uv / pip project manifest (dependencies)
 ├── requirements_polling.txt  # Controller dependencies
 ├── rg_controller.py          # Flask API + SQLite + background finalize/timeout thread + dashboard
 ├── rg_worker.sh              # Worker poll/claim/export/upload script (cron on each server)
