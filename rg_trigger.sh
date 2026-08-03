@@ -2,9 +2,10 @@
 # ============================================================
 # RG Parquet Export — Trigger Script (deploy on b80)
 # ============================================================
-# Cron: 0 1 1 * *  (1st of each month at 01:00)
+# Cron: 30 1 * * *  (daily at 01:30 — idempotent, so a missed/failed run
+#                    retries the next day; tasks for a month are created once)
 #   crontab -e
-#   0 1 1 * * /path/to/rg_trigger.sh
+#   30 1 * * * /path/to/rg_trigger.sh
 #
 # Idempotent — controller skips if tasks already exist for the month.
 # ============================================================

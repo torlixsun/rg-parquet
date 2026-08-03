@@ -98,6 +98,15 @@ USER_FILES_DIR="${USER_FILES_DIR:-/var/lib/clickhouse/user_files}"
 USER_FILES_DIR="${USER_FILES_DIR%/}"
 log "ClickHouse user_files_path: ${USER_FILES_DIR}"
 
+# Run a ClickHouse count query. Prints the count on success, nothing on
+# failure (caller decides how to treat an unreadable count — never fake 0).
+ch_count() {
+    local sql="$1"
+    local out
+    out=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" -q "$sql" 2>>"$LOG_FILE") || return 1
+    printf '%s' "$out"
+}
+
 # ============================================================
 # Step 1: Send heartbeat
 # ============================================================
@@ -156,12 +165,11 @@ for template in "${TABLES[@]}"; do
     # ---- Idempotency: skip if already on Seagate ----
     if aws s3 ls "$S3_PATH" --profile "${AWS_PROFILE}" --endpoint-url "${SEAGATE_ENDPOINT}" 2>/dev/null | grep -qF ".parquet"; then
         log "  Already on Seagate, skipping"
-        LOCAL_COUNT=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
-            -q "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}" 2>/dev/null | tr -d '\n' || echo 0)
+        LOCAL_COUNT=$(ch_count "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}") || LOCAL_COUNT=0
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
             -H "X-API-Token: ${API_TOKEN}" \
-            -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"skipped\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${LOCAL_COUNT}}" \
+            -d "{\"table_name\": \"${TABLE_NAME}\", \"server\": \"${SERVER_NAME}\", \"status\": \"skipped\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${LOCAL_COUNT}}" \
             >/dev/null 2>&1 || true
         continue
     fi
@@ -191,7 +199,7 @@ for template in "${TABLES[@]}"; do
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
             -H "X-API-Token: ${API_TOKEN}" \
-            -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"error_msg\": \"export failed after 5 retries\"}" \
+            -d "{\"table_name\": \"${TABLE_NAME}\", \"server\": \"${SERVER_NAME}\", \"status\": \"failed\", \"error_msg\": \"export failed after 5 retries\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
         rm -rf "$(dirname "$FILE_DISK")" 2>/dev/null || true
@@ -216,7 +224,7 @@ for template in "${TABLES[@]}"; do
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
             -H "X-API-Token: ${API_TOKEN}" \
-            -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"error_msg\": \"upload failed after 5 retries\"}" \
+            -d "{\"table_name\": \"${TABLE_NAME}\", \"server\": \"${SERVER_NAME}\", \"status\": \"failed\", \"error_msg\": \"upload failed after 5 retries\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
         rm -rf "$(dirname "$FILE_DISK")" 2>/dev/null || true
@@ -225,24 +233,22 @@ for template in "${TABLES[@]}"; do
     log "  Upload OK"
 
     # ---- Row count validation ----
-    LOCAL_COUNT=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
-        -q "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}" 2>/dev/null | tr -d '\n' || echo 0)
-    EXPORT_COUNT=$(clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
-        --query "SELECT count() FROM file('${FILE_REL}', Parquet)" 2>/dev/null | tr -d '\n' || echo 0)
+    LOCAL_COUNT=$(ch_count "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}") || LOCAL_COUNT=""
+    EXPORT_COUNT=$(ch_count "SELECT count() FROM file('${FILE_REL}', Parquet)") || EXPORT_COUNT=""
 
-    if [ "$LOCAL_COUNT" = "$EXPORT_COUNT" ]; then
+    if [ -n "$LOCAL_COUNT" ] && [ -n "$EXPORT_COUNT" ] && [ "$LOCAL_COUNT" = "$EXPORT_COUNT" ]; then
         log "  Validation OK: ${LOCAL_COUNT} rows"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
             -H "X-API-Token: ${API_TOKEN}" \
-            -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"complete\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${EXPORT_COUNT}}" \
+            -d "{\"table_name\": \"${TABLE_NAME}\", \"server\": \"${SERVER_NAME}\", \"status\": \"complete\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${EXPORT_COUNT}}" \
             >/dev/null 2>&1 || true
     else
-        log "  Validation MISMATCH: local=${LOCAL_COUNT} export=${EXPORT_COUNT}"
+        log "  Validation FAILED: local=${LOCAL_COUNT:-?} export=${EXPORT_COUNT:-?}"
         curl -sf -X POST "${CONTROLLER_URL}/api/tasks/${TASK_ID}/tables" \
             -H "Content-Type: application/json" \
             -H "X-API-Token: ${API_TOKEN}" \
-            -d "{\"table_name\": \"${TABLE_NAME}\", \"status\": \"failed\", \"rows_local\": ${LOCAL_COUNT}, \"rows_s3\": ${EXPORT_COUNT}, \"error_msg\": \"row count mismatch\"}" \
+            -d "{\"table_name\": \"${TABLE_NAME}\", \"server\": \"${SERVER_NAME}\", \"status\": \"failed\", \"rows_local\": ${LOCAL_COUNT:-0}, \"rows_s3\": ${EXPORT_COUNT:-0}, \"error_msg\": \"row count mismatch or count query failed\"}" \
             >/dev/null 2>&1 || true
         FAILED_TABLES=$((FAILED_TABLES + 1))
     fi

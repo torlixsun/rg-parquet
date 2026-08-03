@@ -538,6 +538,33 @@ def update_table_status(task_id):
     task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
     if not task:
         return jsonify({"error": "Task not found"}), 404
+
+    # The table must belong to the task's month.
+    m = re.search(r"_(\d{6})_", table_name)
+    if not m or m.group(1) != task["month"]:
+        return (
+            jsonify(
+                {
+                    "error": f"Table '{table_name}' does not belong to "
+                    f"task month {task['month']}"
+                }
+            ),
+            400,
+        )
+
+    # If the reporter identifies itself, it must own the task.
+    server = data.get("server", "").strip()
+    if server and server != task["server"]:
+        return (
+            jsonify(
+                {
+                    "error": f"Server mismatch: task {task_id} belongs to "
+                    f"{task['server']}, not {server}"
+                }
+            ),
+            400,
+        )
+
     now = _now()
     db.execute(
         "INSERT INTO task_table_status (task_id, table_name, status, rows_local, rows_s3, error_msg, updated_at) "
@@ -586,6 +613,10 @@ def reset_task(task_id):
             ),
             409,
         )
+
+    # Allow the cycle to be re-finalized after the retry completes: the month
+    # was previously finalized (e.g. partial_failure), so remove that result.
+    db.execute("DELETE FROM finalize_log WHERE month=?", (task["month"],))
 
     db.execute(
         "UPDATE task_status SET status='new', started_at=NULL, completed_at=NULL, error_msg='' "
@@ -657,7 +688,14 @@ def status():
         ).fetchone()
         if fin:
             finalize = dict(fin)
-            finalize["details"] = json.loads(fin["details"]) if fin["details"] else []
+            try:
+                finalize["details"] = (
+                    json.loads(fin["details"]) if fin["details"] else []
+                )
+            except (TypeError, ValueError):
+                # Defensive: corrupted/hand-edited rows must not break /api/status
+                finalize["details"] = []
+                finalize["details_error"] = "corrupt"
 
     # Workers
     workers = [
@@ -1096,8 +1134,8 @@ async function fetchStatus(){
 
     const done=tasks.filter(t=>['complete','failed','timeout'].includes(t.status)).length;
     const inProg=tasks.filter(t=>t.status==='progress').length;
-    const failed=tasks.filter(t=>t.status==='failed').length;
     document.getElementById('sv-done').textContent=done+'/12';
+    const finStatus=(d.finalize&&d.finalize.status)||null;
 
     // Cycle state
     const cycleEl=document.getElementById('sv-cycle');
@@ -1107,7 +1145,7 @@ async function fetchStatus(){
       dispatched:['info','Waiting for workers to pick up'],
       running:['warn',`${inProg} in progress`],
       ready_for_finalize:['warn','All done, awaiting finalize'],
-      finalized: failed>0?['err',`${failed} servers failed`]:['ok','Validation complete'],
+      finalized: finStatus==='success'?['ok','Validation complete']:(finStatus==='mismatch'?['err','Validation mismatch']:['err','Partial failure / stalled']),
       stalled:['err','Tasks stuck — manual intervention needed']
     };
     const [cls,sub]=cycleMap[d.cycle_state]||['idle','—'];

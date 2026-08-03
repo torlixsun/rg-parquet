@@ -9,7 +9,7 @@ Exports 16 ClickHouse tables per server (× 12 servers `lweb-rg-001` ~ `012`) to
 ## Architecture
 
 ```
-┌──────────────┐   monthly cron (1st, 01:00)   ┌──────────────────────────────┐
+┌──────────────┐   daily cron (01:30, idempotent) ┌────────────────────────────┐
 │  b80 trigger │ ─── POST /api/tasks ────────▶ │         Controller           │
 │ rg_trigger.sh│        (idempotent)           │  Flask API + SQLite          │
 └──────────────┘                               │  rg_export.db                │
@@ -49,7 +49,7 @@ new ──▶ progress ──▶ complete
           └────────▶ timeout (48h, needs manual /api/tasks/<id>/reset)
 ```
 
-- **Trigger** (`rg_trigger.sh`): monthly cron, creates tasks for last month. Idempotent — if tasks exist, the controller returns them instead of duplicating.
+- **Trigger** (`rg_trigger.sh`): daily cron, creates tasks for last month. Idempotent — if tasks exist, the controller returns them instead of duplicating, so a missed or failed run retries the next day.
 - **Controller** (`rg_controller.py`): serves the API, auto-finalizes when all 12 tasks are done, compares local ClickHouse vs Seagate S3 row counts, alerts on success/mismatch/failure, and marks long-running tasks as `timeout` after `TASK_TIMEOUT_HOURS`.
 - **Worker** (`rg_worker.sh`): cron every 5 min on each server. Heartbeat → poll for its own `new` task → atomically claim (`WHERE status='new'`) → export 16 tables to Parquet (`FUNCTION file()`, zstd) → upload to Seagate (5× retry) → validate row counts → report per-table status → mark task complete/failed.
 
@@ -94,7 +94,7 @@ The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012
 ### 4. Deploy Trigger (b80)
 
 ```bash
-0 1 1 * * /path/to/rg_trigger.sh >> /var/log/rg_trigger.log 2>&1
+30 1 * * * /path/to/rg_trigger.sh >> /var/log/rg_trigger.log 2>&1
 ```
 
 ## API Endpoints
