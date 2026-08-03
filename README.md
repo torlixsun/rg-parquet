@@ -122,6 +122,8 @@ Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
 
 The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012`).
 
+Parquet files are written to `<ClickHouse user_files_path>/exports` by default. To use a different (e.g. larger) disk, set `EXPORT_DIR=/data/rg-exports` in the worker's `.env`. If the directory is outside ClickHouse's `user_files_path`, the `clickhouse` user must be able to write it and the server must allow the path for the `file()` function; after upload the worker deletes the local files.
+
 ### 5. Deploy Trigger (b80)
 
 Requires the `mysql` client and access to MySQL (`MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` in `.env`). The script skips dispatch until the readiness check passes, so it can run daily.

@@ -33,6 +33,12 @@ CH_LOCAL_DB="${CH_LOCAL_DB:-monthly_ranking}"
 AWS_PROFILE="${AWS_PROFILE:-seagate}"
 SEAGATE_ENDPOINT="${SEAGATE_ENDPOINT:-https://s3.us-east-1.clarity1.lyve.seagate.com}"
 API_TOKEN="${API_TOKEN:-}"
+# Where temporary parquet files are written on this worker.
+# Empty = <ClickHouse user_files_path>/exports (default, always works).
+# Set e.g. EXPORT_DIR=/data/rg-exports for a larger disk; if that path is
+# outside user_files_path, the clickhouse user must be able to write it and
+# the server must allow the path for the file() function.
+EXPORT_DIR="${EXPORT_DIR:-}"
 
 # Logging
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -98,6 +104,26 @@ USER_FILES_DIR="${USER_FILES_DIR:-/var/lib/clickhouse/user_files}"
 USER_FILES_DIR="${USER_FILES_DIR%/}"
 log "ClickHouse user_files_path: ${USER_FILES_DIR}"
 
+# Resolve the export base directory + the path ClickHouse's file() should use.
+if [ -n "${EXPORT_DIR}" ]; then
+    EXPORT_DIR="${EXPORT_DIR%/}"
+    case "${EXPORT_DIR}" in
+        "${USER_FILES_DIR}"|"${USER_FILES_DIR}/"*)
+            FILE_BASE_DIR="${EXPORT_DIR}"
+            FILE_BASE_REL="${EXPORT_DIR#${USER_FILES_DIR}/}"
+            ;;
+        *)
+            FILE_BASE_DIR="${EXPORT_DIR}"
+            FILE_BASE_REL=""
+            log "EXPORT_DIR (${EXPORT_DIR}) is outside user_files_path (${USER_FILES_DIR}); ClickHouse file() must allow this path"
+            ;;
+    esac
+else
+    FILE_BASE_DIR="${USER_FILES_DIR}/exports"
+    FILE_BASE_REL="exports"
+fi
+log "Parquet export dir: ${FILE_BASE_DIR}"
+
 # Run a ClickHouse count query. Prints the count on success, nothing on
 # failure (caller decides how to treat an unreadable count — never fake 0).
 ch_count() {
@@ -156,8 +182,12 @@ FAILED_TABLES=0
 
 for template in "${TABLES[@]}"; do
     TABLE_NAME="${template/\{m\}/$MONTH}"
-    FILE_REL="exports/${TABLE_NAME}/${SERVER_NAME}.parquet"
-    FILE_DISK="${USER_FILES_DIR}/${FILE_REL}"
+    FILE_DISK="${FILE_BASE_DIR}/${TABLE_NAME}/${SERVER_NAME}.parquet"
+    if [ -n "${FILE_BASE_REL}" ]; then
+        CH_FILE_PATH="${FILE_BASE_REL}/${TABLE_NAME}/${SERVER_NAME}.parquet"
+    else
+        CH_FILE_PATH="${FILE_DISK}"
+    fi
     S3_PATH="s3://rg-datalake-${YEAR}/${TABLE_NAME}/${SERVER_NAME}.parquet"
 
     log "Processing ${TABLE_NAME}..."
@@ -182,7 +212,7 @@ for template in "${TABLES[@]}"; do
     EXPORT_OK=0
     for attempt in $(seq 1 5); do
         if clickhouse-client --password "${CH_LOCAL_PASSWORD}" \
-            --query "INSERT INTO FUNCTION file('${FILE_REL}', Parquet) \
+            --query "INSERT INTO FUNCTION file('${CH_FILE_PATH}', Parquet) \
                 SELECT * FROM ${CH_LOCAL_DB}.local_${TABLE_NAME} \
                 SETTINGS output_format_parquet_row_group_size = 1000000, \
                          output_format_parquet_compression_method = 'zstd', \
@@ -234,7 +264,7 @@ for template in "${TABLES[@]}"; do
 
     # ---- Row count validation ----
     LOCAL_COUNT=$(ch_count "SELECT count() FROM ${CH_LOCAL_DB}.local_${TABLE_NAME}") || LOCAL_COUNT=""
-    EXPORT_COUNT=$(ch_count "SELECT count() FROM file('${FILE_REL}', Parquet)") || EXPORT_COUNT=""
+    EXPORT_COUNT=$(ch_count "SELECT count() FROM file('${CH_FILE_PATH}', Parquet)") || EXPORT_COUNT=""
 
     if [ -n "$LOCAL_COUNT" ] && [ -n "$EXPORT_COUNT" ] && [ "$LOCAL_COUNT" = "$EXPORT_COUNT" ]; then
         log "  Validation OK: ${LOCAL_COUNT} rows"
