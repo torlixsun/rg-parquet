@@ -237,6 +237,15 @@ def run_comparison(target_month):
             {"table": "__connect__", "local": "OK", "cloud": "ERROR", "diff": str(exc)}
         ]
 
+    # Reject credentials containing single-quotes — they break the s3() SQL string.
+    # The s3() table function only accepts inline credential literals, not parameters.
+    if "'" in SEAGATE_KEY_ID or "'" in SEAGATE_SECRET:
+        print("[COMPARE] Seagate credentials contain single-quote — cannot run S3 queries")
+        return False, [
+            {"table": "__config__", "local": "OK", "cloud": "ERROR",
+             "diff": "credential contains quote character"}
+        ]
+
     details = []
     all_ok = True
 
@@ -500,6 +509,17 @@ def update_table_status(task_id):
     if not table_name or not status:
         return jsonify({"error": "table_name and status required"}), 400
 
+    if status not in ("complete", "failed", "skipped", "pending"):
+        return (
+            jsonify(
+                {
+                    "error": f"Invalid status '{status}'. "
+                    f"Must be one of: complete, failed, skipped, pending."
+                }
+            ),
+            400,
+        )
+
     # Validate table_name against known patterns
     valid_tables = {t.format(m="YYYYMM") for t in RG_TABLES}
     normalized = re.sub(r"_\d{6}_", "_YYYYMM_", table_name)
@@ -549,6 +569,24 @@ def reset_task(task_id):
         return auth_err
 
     db = get_db()
+
+    # Verify task exists
+    task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
+    if not task:
+        return jsonify({"error": "Task not found"}), 404
+
+    # Refuse to reset a task currently being worked on
+    if task["status"] == "progress":
+        return (
+            jsonify(
+                {
+                    "error": "Cannot reset a task in 'progress' state. "
+                    "Wait for the worker to finish or for the task to timeout."
+                }
+            ),
+            409,
+        )
+
     db.execute(
         "UPDATE task_status SET status='new', started_at=NULL, completed_at=NULL, error_msg='' "
         "WHERE id=?",
@@ -560,7 +598,7 @@ def reset_task(task_id):
         (task_id,),
     )
     db.commit()
-    return jsonify({"ok": True, "message": "Task reset to 'new'"})
+    return jsonify({"ok": True, "message": f"Task {task_id} reset to 'new'"})
 
 
 # ---- Heartbeat ----
@@ -1112,8 +1150,10 @@ async function fetchStatus(){
       }
       const onlineDot = w && w.online;
       const sCls = status==='idle'?'':`s-${status}`;
+      const resetBtn=(status==='failed'||status==='timeout')?
+        ` <button onclick="event.stopPropagation();doReset(${t.id},'${srv}')" style="font-size:.6rem;padding:1px 8px;border-radius:8px;border:1px solid var(--red);background:var(--red-bg);color:var(--red);cursor:pointer;margin-left:4px" title="Reset task to 'new' for retry">Retry</button>`:'';
       html+=`<div class="server-card ${sCls}" onclick="toggleDetail('${srv}',${t?t.id:'null'})">
-        <div class="server-name">${srv} ${onlineDot?'<span style="color:var(--green);font-size:.6rem">●</span>':'<span style="color:var(--red);font-size:.6rem">○</span>'}</div>
+        <div class="server-name">${srv} ${onlineDot?'<span style="color:var(--green);font-size:.6rem">●</span>':'<span style="color:var(--red);font-size:.6rem">○</span>'}${resetBtn}</div>
         <div class="server-status"><span class="server-dot ${status==='idle'?'':status}"></span>${status}</div>
         <div class="server-progress">${progressText}</div>
         <div class="table-detail" id="detail-${srv}"></div>
@@ -1206,6 +1246,17 @@ async function doFinalize(){
   }catch(e){showMsg('Error: '+e.message)}
 }
 
+async function doReset(taskId,srv){
+  if(!confirm(`Reset task ${taskId} (${srv}) to 'new'?`))return;
+  try{
+    const r=await fetch(`/api/tasks/${taskId}/reset`,{method:'POST',headers:{'X-API-Token':apiToken()}});
+    const d=await r.json();
+    if(d.ok) showMsg(`Task ${taskId} reset`);
+    else showMsg(`Reset failed: ${d.error||d.message}`);
+    fetchStatus();
+  }catch(e){showMsg('Error: '+e.message)}
+}
+
 function showMsg(t){document.getElementById('msg').textContent=t;setTimeout(()=>{document.getElementById('msg').textContent=''},5000)}
 
 fetchStatus();
@@ -1232,6 +1283,11 @@ if __name__ == "__main__":
         print(
             "[Controller] ** WARNING: API_TOKEN is not set — mutating endpoints are "
             "UNPROTECTED. Set API_TOKEN in .env to enable authentication."
+        )
+    if "'" in SEAGATE_KEY_ID or "'" in SEAGATE_SECRET:
+        print(
+            "[Controller] ** WARNING: Seagate credentials contain single-quote — "
+            "cross-validation S3 queries will fail. Regenerate credentials without quotes."
         )
 
     t = threading.Thread(target=background_loop, daemon=True)
