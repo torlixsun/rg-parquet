@@ -52,11 +52,24 @@ done
 
 # ---- Prevent concurrent execution ----
 LOCK_DIR="/tmp/rg_worker_${SERVER_NAME}.lock"
+if [ -d "$LOCK_DIR" ]; then
+    # The lock owner is recorded as a PID file, so long-running exports (up to
+    # 48h) are never mistaken for stale locks. Only a dead/missing owner is stale.
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '')"
+    if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+        log "Another worker instance is running (PID ${LOCK_PID}), exiting."
+        exit 0
+    fi
+    log "Removing stale lock (owner PID ${LOCK_PID:-unknown} is not running)"
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    log "Another worker instance is running (or stale lock), exiting."
+    log "Race: another worker claimed the lock, exiting."
     exit 0
 fi
-trap 'rmdir "$LOCK_DIR"' EXIT
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 # ---- 16 table templates ----
 TABLES=(

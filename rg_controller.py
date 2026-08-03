@@ -728,22 +728,26 @@ def _do_finalize_locked(target_month):
                 "pending": [t["server"] for t in not_done],
             }
 
-        failed_servers = [t for t in tasks if t["status"] == "failed"]
+        failed_servers = [t for t in tasks if t["status"] in ("failed", "timeout")]
 
         if failed_servers:
-            names = [t["server"] for t in failed_servers]
+            names = [f"{t['server']} ({t['status']})" for t in failed_servers]
             send_alert(
                 "RG export completed with failures",
-                f"Month: {target_month}\nFailed servers: {names}",
+                f"Month: {target_month}\nServers not completed: {names}",
                 "WARNING",
                 ["rg-parquet", "export", "partial-failure"],
             )
+            details = [
+                {"server": t["server"], "status": t["status"]}
+                for t in failed_servers
+            ]
             conn.execute(
                 "INSERT INTO finalize_log (month, status, details, created_at) VALUES (?, ?, ?, ?)",
                 (
                     target_month,
                     "partial_failure",
-                    json.dumps({"failed_servers": names}),
+                    json.dumps(details),
                     _now(),
                 ),
             )
@@ -1018,6 +1022,7 @@ table.tbl td.warn{color:var(--yellow)}
   <div class="server-grid" id="servers"></div>
   <div class="actions">
     <input id="dispatch-month" placeholder="202608" maxlength="6">
+    <input id="api-token" type="password" placeholder="API Token" maxlength="128" style="max-width:180px" title="Enter the API token from .env to enable Dispatch / Finalize">
     <button class="btn-primary" onclick="doDispatch()">Dispatch</button>
     <button class="btn-danger" onclick="doFinalize()">Finalize</button>
   </div>
@@ -1029,10 +1034,16 @@ table.tbl td.warn{color:var(--yellow)}
 <div class="footer">Last update: <span id="last-update">&mdash;</span></div>
 
 <script>
-const API_TOKEN = "___API_TOKEN___";
 const SERVERS=[...Array(12)].map((_,i)=>'lweb-rg-'+String(i+1).padStart(3,'0'));
 
 function pill(cls,txt){return `<span class="pill pill-${cls}">${txt}</span>`}
+
+// API token is entered by the operator and kept only in this tab (sessionStorage),
+// never embedded in the page source.
+const tokenInput=document.getElementById('api-token');
+tokenInput.value=sessionStorage.getItem('rg_api_token')||'';
+tokenInput.addEventListener('input',()=>{sessionStorage.setItem('rg_api_token',tokenInput.value.trim())});
+function apiToken(){return tokenInput.value.trim();}
 
 async function fetchStatus(){
   try{
@@ -1045,7 +1056,7 @@ async function fetchStatus(){
     document.getElementById('sv-month').textContent=d.month||'—';
     document.getElementById('sv-month-sub').textContent=d.cycle_state||'—';
 
-    const done=tasks.filter(t=>['complete','failed'].includes(t.status)).length;
+    const done=tasks.filter(t=>['complete','failed','timeout'].includes(t.status)).length;
     const inProg=tasks.filter(t=>t.status==='progress').length;
     const failed=tasks.filter(t=>t.status==='failed').length;
     document.getElementById('sv-done').textContent=done+'/12';
@@ -1115,18 +1126,26 @@ async function fetchStatus(){
     const finSection=document.getElementById('finalize-section');
     if(d.finalize){
       const fin=d.finalize;
-      const details=fin.details||[];
+      const details=Array.isArray(fin.details)?fin.details:[];
       let finHtml='<div class="card"><div class="card-header"><h2>Finalize Results</h2>';
       finHtml+=pill(fin.status==='success'?'ok':fin.status==='mismatch'?'err':'warn',fin.status);
-      finHtml+='</div><div class="fin-detail"><table><tr><th>Table</th><th>Local</th><th>Cloud</th><th>Diff</th></tr>';
-      details.forEach(d=>{
-        const diff=d.diff;
-        let cls='';
-        if(diff===0) cls='ok';
-        else if(diff==='-'||diff==='ERROR') cls='err';
-        else cls='warn';
-        finHtml+=`<tr><td>${d.table}</td><td>${d.local||'—'}</td><td>${d.cloud||'—'}</td><td class="${cls}">${diff}</td></tr>`;
-      });
+      finHtml+='</div><div class="fin-detail">';
+      if(fin.status==='partial_failure'){
+        finHtml+='<table><tr><th>Server</th><th>Status</th></tr>';
+        details.forEach(d=>{
+          finHtml+=`<tr><td>${d.server||'—'}</td><td class="err">${d.status||'—'}</td></tr>`;
+        });
+      } else {
+        finHtml+='<table><tr><th>Table</th><th>Local</th><th>Cloud</th><th>Diff</th></tr>';
+        details.forEach(d=>{
+          const diff=d.diff;
+          let cls='';
+          if(diff===0) cls='ok';
+          else if(diff==='-'||diff==='ERROR') cls='err';
+          else cls='warn';
+          finHtml+=`<tr><td>${d.table}</td><td>${d.local||'—'}</td><td>${d.cloud||'—'}</td><td class="${cls}">${diff}</td></tr>`;
+        });
+      }
       finHtml+='</table></div></div>';
       finSection.innerHTML=finHtml;
     } else {
@@ -1167,7 +1186,7 @@ async function doDispatch(){
   const m=document.getElementById('dispatch-month').value.trim();
   if(!m){showMsg('Enter a month (YYYYMM)');return}
   try{
-    const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json','X-API-Token':API_TOKEN},body:JSON.stringify({month:m})});
+    const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json','X-API-Token':apiToken()},body:JSON.stringify({month:m})});
     const d=await r.json();
     if(d.created>0) showMsg(`Created ${d.created} tasks for ${m}`);
     else showMsg(`Tasks already exist for ${m}`);
@@ -1180,7 +1199,7 @@ async function doFinalize(){
   if(!m){showMsg('Enter a month (YYYYMM) to finalize');return}
   showMsg('Triggering finalize...');
   try{
-    const r=await fetch(`/api/finalize/${m}`,{method:'POST',headers:{'X-API-Token':API_TOKEN}});
+    const r=await fetch(`/api/finalize/${m}`,{method:'POST',headers:{'X-API-Token':apiToken()}});
     const d=await r.json();
     showMsg(`Finalize: ${d.status}`);
     fetchStatus();
@@ -1198,7 +1217,7 @@ setInterval(fetchStatus,30000);
 
 @app.route("/dashboard")
 def dashboard():
-    return render_template_string(DASHBOARD_HTML.replace("___API_TOKEN___", API_TOKEN))
+    return render_template_string(DASHBOARD_HTML)
 
 
 # ============================================================

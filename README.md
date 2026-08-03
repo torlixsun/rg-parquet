@@ -113,7 +113,7 @@ The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012
 | `/api/tasks/<id>/reset` | POST | yes | Reset a task to `new` (retry after timeout/failure) |
 | `/api/finalize/<month>` | POST | yes | Manually trigger finalize/comparison |
 
-Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay open so the dashboard works in the browser.
+Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay open so the dashboard works in the browser. The dashboard's Dispatch / Finalize buttons need the token entered in the "API Token" field (kept only in the browser tab, never embedded in the page).
 
 ## Safety
 
