@@ -94,7 +94,25 @@ pip3 install -r requirements_polling.txt --break-system-packages
 python3 rg_controller.py
 ```
 
-### 3. Deploy Workers (12 machines)
+### 3. Run as a systemd service (recommended for production)
+
+`deploy/rg-controller.service` runs the controller under systemd (auto-restart, logs via journald):
+
+```bash
+sudo cp deploy/rg-controller.service /etc/systemd/system/
+# edit /etc/systemd/system/rg-controller.service: fix WorkingDirectory / ExecStart / User
+
+sudo uv sync                      # create .venv (or pip3 install -r requirements_polling.txt)
+sudo systemctl daemon-reload
+sudo systemctl enable --now rg-controller
+
+systemctl status rg-controller    # check status
+journalctl -u rg-controller -f    # follow logs
+```
+
+The service runs `rg_controller.py` directly, so `start_controller.sh` and its PID-file guard are not used under systemd.
+
+### 4. Deploy Workers (12 machines)
 
 Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
 
@@ -104,7 +122,7 @@ Copy `rg_worker.sh` (and `.env`) to each server, then add to crontab:
 
 The server short hostname must match a task name (`lweb-rg-001` … `lweb-rg-012`).
 
-### 4. Deploy Trigger (b80)
+### 5. Deploy Trigger (b80)
 
 ```bash
 30 1 * * * /path/to/rg_trigger.sh >> /var/log/rg_trigger.log 2>&1
@@ -140,6 +158,8 @@ Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay
 
 ```
 ├── .env.example              # Config template (placeholders — never commit real secrets)
+├── deploy/
+│   └── rg-controller.service # systemd unit for the controller
 ├── pyproject.toml            # uv / pip project manifest (dependencies)
 ├── requirements_polling.txt  # Controller dependencies
 ├── rg_controller.py          # Flask API + SQLite + background finalize/timeout thread + dashboard

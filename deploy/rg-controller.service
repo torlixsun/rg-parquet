@@ -1,0 +1,37 @@
+[Unit]
+Description=RG Parquet Export Controller (Flask API + SQLite)
+Documentation=file:///opt/rg-parquet/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- Adjust to your deployment ---
+# Directory that contains rg_controller.py and .env
+WorkingDirectory=/opt/rg-parquet
+# ExecStart=/opt/rg-parquet/.venv/bin/python rg_controller.py
+#   ^ if you use uv, create the venv first:  uv sync
+#   alternatively:  ExecStart=/usr/local/bin/uv run --project /opt/rg-parquet python rg_controller.py
+ExecStart=/opt/rg-parquet/.venv/bin/python rg_controller.py
+# Run as a dedicated user if you prefer (must be able to read/write WorkingDirectory):
+# User=rg
+User=root
+
+Restart=on-failure
+RestartSec=5
+
+# Controller reads .env from its own directory; keep stdout unbuffered so
+# journalctl shows logs as they happen.
+Environment=PYTHONUNBUFFERED=1
+
+# Optional hardening (uncomment if paths match; ProtectHome would block
+# repos located under /home, and ReadWritePaths must include WorkingDirectory):
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=full
+# ProtectHome=true
+# ReadWritePaths=/opt/rg-parquet
+
+[Install]
+WantedBy=multi-user.target
