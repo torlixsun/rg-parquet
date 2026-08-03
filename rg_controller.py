@@ -808,16 +808,44 @@ def _do_finalize_locked(target_month):
 
         if failed_servers:
             names = [f"{t['server']} ({t['status']})" for t in failed_servers]
+            details = []
+            lines = []
+            for t in failed_servers:
+                details.append({"server": t["server"], "status": t["status"]})
+                lines.append(f"  {t['server']} ({t['status']})")
+                tables = conn.execute(
+                    "SELECT table_name, status, rows_local, rows_s3, error_msg "
+                    "FROM task_table_status WHERE task_id=? ORDER BY table_name",
+                    (t["id"],),
+                ).fetchall()
+                for tb in tables:
+                    d = dict(tb)
+                    diff = "-"
+                    if isinstance(d["rows_local"], int) and isinstance(d["rows_s3"], int):
+                        diff = d["rows_s3"] - d["rows_local"]
+                    details.append(
+                        {
+                            "table": d["table_name"],
+                            "status": d["status"],
+                            "rows_local": d["rows_local"],
+                            "rows_s3": d["rows_s3"],
+                            "diff": diff,
+                            "error_msg": d["error_msg"] or "",
+                        }
+                    )
+                    if d["status"] == "failed":
+                        lines.append(
+                            f"  FAILED {d['table_name']}  "
+                            f"local={d['rows_local']}  parquet={d['rows_s3']}  "
+                            f"diff={diff}  {d['error_msg'] or ''}".rstrip()
+                        )
             send_alert(
                 "RG export completed with failures",
-                f"Month: {target_month}\nServers not completed: {names}",
+                f"Month: {target_month}\nServers not completed: {names}\n"
+                + "\n".join(lines),
                 "WARNING",
                 ["rg-parquet", "export", "partial-failure"],
             )
-            details = [
-                {"server": t["server"], "status": t["status"]}
-                for t in failed_servers
-            ]
             conn.execute(
                 "INSERT INTO finalize_log (month, status, details, created_at) VALUES (?, ?, ?, ?)",
                 (
@@ -1209,9 +1237,15 @@ async function fetchStatus(){
       finHtml+=pill(fin.status==='success'?'ok':fin.status==='mismatch'?'err':'warn',fin.status);
       finHtml+='</div><div class="fin-detail">';
       if(fin.status==='partial_failure'){
-        finHtml+='<table><tr><th>Server</th><th>Status</th></tr>';
+        finHtml+='<table><tr><th>Server / Table</th><th>Status</th><th>Local</th><th>Parquet</th><th>Diff</th></tr>';
         details.forEach(d=>{
-          finHtml+=`<tr><td>${d.server||'—'}</td><td class="err">${d.status||'—'}</td></tr>`;
+          if(d.server){
+            finHtml+=`<tr><td><b>${d.server}</b></td><td class="err">${d.status}</td><td>—</td><td>—</td><td>—</td></tr>`;
+          } else {
+            const cls=(d.status==='complete'||d.status==='skipped')?'ok':(d.status==='failed'?'err':'warn');
+            const diffCls=(d.diff===0)?'ok':'warn';
+            finHtml+=`<tr><td style="font-size:.66rem">${d.table}</td><td class="${cls}">${d.status}</td><td>${d.rows_local||0}</td><td>${d.rows_s3||0}</td><td class="${diffCls}">${d.diff}</td></tr>`;
+          }
         });
       } else {
         finHtml+='<table><tr><th>Table</th><th>Local</th><th>Cloud</th><th>Diff</th></tr>';
