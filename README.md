@@ -148,6 +148,7 @@ Requires the `mysql` client and access to MySQL (`MYSQL_HOST` / `MYSQL_PORT` / `
 | `/api/tasks/<id>/reset` | POST | yes | Reset a task to `new` (retry after timeout/failure) |
 | `/api/heartbeat` | POST | yes | Worker liveness ping |
 | `/api/finalize/<month>` | POST | yes | Manually trigger finalize/comparison |
+| `/api/finalize/<month>/acknowledge` | POST | yes | Mark a `mismatch` finalize as OK after manual review (status becomes `acknowledged`, diffs kept) |
 
 Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay open so the dashboard works in the browser. The dashboard's Dispatch / Finalize buttons need the token entered in the "API Token" field (kept only in the browser tab, never embedded in the page).
 

@@ -275,9 +275,14 @@ def run_comparison(target_month):
                 f"SELECT count() FROM s3('{s3_url}', '{SEAGATE_KEY_ID}', '{SEAGATE_SECRET}', 'Parquet')"
             )[0][0]
         except Exception as exc:
-            print(f"[COMPARE] Cloud query failed {tb}: {exc}")
+            print(f"[COMPARE] Cloud query failed {tb}: {exc}\n  s3_url: {s3_url}")
+            cloud_label = (
+                "NO_FILES"
+                if "no files with provided path in S3 or all files are empty" in str(exc)
+                else "ERROR"
+            )
             details.append(
-                {"table": tb, "local": local_count, "cloud": "ERROR", "diff": "-"}
+                {"table": tb, "local": local_count, "cloud": cloud_label, "diff": "-"}
             )
             all_ok = False
             continue
@@ -767,6 +772,43 @@ def manual_finalize(month):
     return jsonify(result)
 
 
+@app.route("/api/finalize/<month>/acknowledge", methods=["POST"])
+def acknowledge_finalize(month):
+    """
+    Manually mark a mismatched comparison as OK after review.
+    The per-table details (diffs) are kept unchanged for the record.
+    """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    if not _valid_month(month):
+        return jsonify({"error": "Invalid month. Use YYYYMM (e.g. 202608)."}), 400
+
+    db = get_db()
+    fin = db.execute(
+        "SELECT * FROM finalize_log WHERE month=?", (month,)
+    ).fetchone()
+    if not fin:
+        return jsonify({"error": "No finalize record for this month"}), 404
+    if fin["status"] != "mismatch":
+        return (
+            jsonify(
+                {
+                    "error": f"Only 'mismatch' results can be acknowledged "
+                    f"(current status: {fin['status']})"
+                }
+            ),
+            409,
+        )
+
+    db.execute(
+        "UPDATE finalize_log SET status='acknowledged' WHERE month=?", (month,)
+    )
+    db.commit()
+    return jsonify({"ok": True, "month": month, "status": "acknowledged"})
+
+
 # ============================================================
 # Finalize logic
 # ============================================================
@@ -1178,7 +1220,7 @@ async function fetchStatus(){
       dispatched:['info','Waiting for workers to pick up'],
       running:['warn',`${inProg} in progress`],
       ready_for_finalize:['warn','All done, awaiting finalize'],
-      finalized: finStatus==='success'?['ok','Validation complete']:(finStatus==='mismatch'?['err','Validation mismatch']:['err','Partial failure / stalled']),
+      finalized: finStatus==='success'?['ok','Validation complete']:(finStatus==='acknowledged'?['ok','Accepted after review']:(finStatus==='mismatch'?['err','Validation mismatch']:['err','Partial failure / stalled'])),
       stalled:['err','Tasks stuck — manual intervention needed']
     };
     const [cls,sub]=cycleMap[d.cycle_state]||['idle','—'];
@@ -1239,7 +1281,10 @@ async function fetchStatus(){
       const fin=d.finalize;
       const details=Array.isArray(fin.details)?fin.details:[];
       let finHtml='<div class="card"><div class="card-header"><h2>Finalize Results</h2>';
-      finHtml+=pill(fin.status==='success'?'ok':fin.status==='mismatch'?'err':'warn',fin.status);
+      finHtml+=pill((fin.status==='success'||fin.status==='acknowledged')?'ok':(fin.status==='mismatch'?'err':'warn'),fin.status);
+      if(fin.status==='mismatch'){
+        finHtml+=`<button class="btn-primary" onclick="doAcknowledge('${d.month}')" style="font-size:.7rem;padding:3px 12px;margin-left:10px">Mark as OK (reviewed)</button>`;
+      }
       finHtml+='</div><div class="fin-detail">';
       if(fin.status==='partial_failure'){
         finHtml+='<table><tr><th>Server / Table</th><th>Status</th><th>Local</th><th>Parquet</th><th>Diff</th></tr>';
@@ -1319,6 +1364,17 @@ async function doFinalize(){
     const r=await fetch(`/api/finalize/${m}`,{method:'POST',headers:{'X-API-Token':apiToken()}});
     const d=await r.json();
     showMsg(`Finalize: ${d.status}`);
+    fetchStatus();
+  }catch(e){showMsg('Error: '+e.message)}
+}
+
+async function doAcknowledge(month){
+  if(!confirm(`Mark month ${month} finalize as OK after review?`))return;
+  try{
+    const r=await fetch(`/api/finalize/${month}/acknowledge`,{method:'POST',headers:{'X-API-Token':apiToken()}});
+    const d=await r.json();
+    if(d.ok) showMsg(`${month} marked as OK (acknowledged)`);
+    else showMsg(`Failed: ${d.error||d.message}`);
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
 }
