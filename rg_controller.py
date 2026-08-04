@@ -845,7 +845,7 @@ def _do_finalize_locked(target_month):
                             f"diff={diff}  {d['error_msg'] or ''}".rstrip()
                         )
             send_alert(
-                "RG export completed with failures",
+                "RG Parquet export completed with failures",
                 f"Month: {target_month}\nServers not completed: {names}\n"
                 + "\n".join(lines),
                 "WARNING",
@@ -884,7 +884,7 @@ def _do_finalize_locked(target_month):
 
         if all_ok:
             send_alert(
-                "RG export & validation completed",
+                "RG Parquet export & validation completed",
                 f"Month: {target_month}\nAll 12 servers finished. {len(details)} tables validated OK.\n"
                 + "\n".join(lines),
                 "INFO",
@@ -893,7 +893,7 @@ def _do_finalize_locked(target_month):
             fin_status = "success"
         else:
             send_alert(
-                "RG validation MISMATCH",
+                "RG Parquet validation MISMATCH",
                 f"Month: {target_month}\n{mismatch_count}/{len(details)} tables have mismatches!\n"
                 + "\n".join(lines),
                 "CRITICAL",
@@ -974,7 +974,7 @@ def background_loop():
                     )
                     if cur.rowcount > 0:
                         send_alert(
-                            "RG export task TIMEOUT",
+                            "RG Parquet export task TIMEOUT",
                             f"Server: {r['server']}\nMonth: {r['month']}\n"
                             f"Started: {r['started_at']}\n"
                             f"Exceeded {TASK_TIMEOUT_HOURS}h. Task marked as 'timeout'.\n"
