@@ -1114,10 +1114,15 @@ header h1 span{color:var(--accent)}
 .btn-primary:hover{filter:brightness(1.15);box-shadow:0 0 14px var(--accent-glow)}
 .btn-danger{background:var(--red-bg);color:var(--red);border:1px solid rgba(239,68,68,.3)}
 .btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-header{margin-left:10px}
 #msg{font-size:.76rem;margin-top:8px;min-height:16px;color:var(--muted)}
 
-.table-detail{display:none;margin-top:12px}
-.table-detail.show{display:block}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100;align-items:center;justify-content:center;padding:24px}
+.modal-overlay.show{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);width:min(720px,100%);max-height:82vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
+.modal-header h3{font-size:.9rem;font-weight:600;letter-spacing:.02em}
+.modal-body{padding:16px 20px;overflow:auto}
 table.tbl{width:100%;border-collapse:collapse;font-size:.74rem}
 table.tbl th{text-align:left;padding:6px 10px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);text-transform:uppercase;font-size:.66rem;letter-spacing:.04em}
 table.tbl td{padding:6px 10px;border-bottom:1px solid var(--surface2);font-family:'JetBrains Mono',monospace}
@@ -1183,6 +1188,16 @@ table.tbl td.warn{color:var(--yellow)}
 <div id="finalize-section"></div>
 
 <div class="footer">Last update: <span id="last-update">&mdash;</span></div>
+
+<div id="detail-modal" class="modal-overlay" onclick="if(event.target===this)closeDetailModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="detail-modal-title">Server Detail</h3>
+      <button class="btn-danger" onclick="closeDetailModal()">Close</button>
+    </div>
+    <div id="detail-modal-body" class="modal-body"></div>
+  </div>
+</div>
 
 <script>
 const SERVERS=[...Array(12)].map((_,i)=>'lweb-rg-'+String(i+1).padStart(3,'0'));
@@ -1269,7 +1284,6 @@ async function fetchStatus(){
         <div class="server-name">${srv} ${onlineDot?'<span style="color:var(--green);font-size:.6rem">●</span>':'<span style="color:var(--red);font-size:.6rem">○</span>'}${resetBtn}</div>
         <div class="server-status"><span class="server-dot ${status==='idle'?'':status}"></span>${status}</div>
         <div class="server-progress">${progressText}</div>
-        <div class="table-detail" id="detail-${srv}"></div>
       </div>`;
     });
     grid.innerHTML=html;
@@ -1283,7 +1297,7 @@ async function fetchStatus(){
       let finHtml='<div class="card"><div class="card-header"><h2>Finalize Results</h2>';
       finHtml+=pill((fin.status==='success'||fin.status==='acknowledged')?'ok':(fin.status==='mismatch'?'err':'warn'),fin.status);
       if(fin.status==='mismatch'){
-        finHtml+=`<button class="btn-primary" onclick="doAcknowledge('${d.month}')" style="font-size:.7rem;padding:3px 12px;margin-left:10px">Mark as OK (reviewed)</button>`;
+        finHtml+=`<button class="btn-primary btn-header" onclick="doAcknowledge('${d.month}')">Mark as OK (reviewed)</button>`;
       }
       finHtml+='</div><div class="fin-detail">';
       if(fin.status==='partial_failure'){
@@ -1321,14 +1335,18 @@ async function fetchStatus(){
 }
 
 async function toggleDetail(srv,taskId){
-  const el=document.getElementById('detail-'+srv);
-  if(el.classList.contains('show')){el.classList.remove('show');return}
-  if(!taskId){el.innerHTML='<span style="color:var(--muted);font-size:.72rem">No task</span>';el.classList.add('show');return}
+  const titleEl=document.getElementById('detail-modal-title');
+  const bodyEl=document.getElementById('detail-modal-body');
+  const modalEl=document.getElementById('detail-modal');
+  titleEl.textContent=srv+(taskId?` — Task #${taskId}`:'');
+  bodyEl.innerHTML='<span style="color:var(--muted)">Loading…</span>';
+  modalEl.classList.add('show');
+  if(!taskId){bodyEl.innerHTML='<span style="color:var(--muted)">No task for this server</span>';return}
   try{
     const r=await fetch(`/api/tasks/${taskId}/tables`);
     const d=await r.json();
     const tables=d.tables||[];
-    if(!tables.length){el.innerHTML='<span style="color:var(--muted);font-size:.72rem">No table data yet</span>';el.classList.add('show');return}
+    if(!tables.length){bodyEl.innerHTML='<span style="color:var(--muted)">No table data yet</span>';return}
     let h='<table class="tbl"><tr><th>Table</th><th>Status</th><th>Local</th><th>S3</th></tr>';
     tables.forEach(t=>{
       let cls='';
@@ -1339,53 +1357,66 @@ async function toggleDetail(srv,taskId){
       h+=`<tr><td style="font-size:.66rem">${t.table_name.replace(/_\d{6}_/,'_XX_')}</td><td class="${cls}">${t.status}</td><td>${t.rows_local||0}</td><td>${t.rows_s3||0}</td></tr>`;
     });
     h+='</table>';
-    el.innerHTML=h;
-    el.classList.add('show');
-  }catch(e){el.innerHTML='Error: '+e.message;el.classList.add('show')}
+    bodyEl.innerHTML=h;
+  }catch(e){bodyEl.innerHTML='Error: '+e.message}
 }
 
+function closeDetailModal(){
+  document.getElementById('detail-modal').classList.remove('show');
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDetailModal()});
+
 async function doDispatch(){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
   const m=document.getElementById('dispatch-month').value.trim();
   if(!m){showMsg('Enter a month (YYYYMM)');return}
   try{
     const r=await fetch('/api/tasks',{method:'POST',headers:{'Content-Type':'application/json','X-API-Token':apiToken()},body:JSON.stringify({month:m})});
     const d=await r.json();
-    if(d.created>0) showMsg(`Created ${d.created} tasks for ${m}`);
-    else showMsg(`Tasks already exist for ${m}`);
+    if(r.ok){
+      if(d.created>0) showMsg(`Created ${d.created} tasks for ${m}`);
+      else showMsg(`Tasks already exist for ${m}`);
+    } else {
+      showMsg(`Dispatch failed (HTTP ${r.status}): ${d.error||d.message}`);
+    }
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
 }
 
 async function doFinalize(){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
   const m=document.getElementById('dispatch-month').value.trim();
   if(!m){showMsg('Enter a month (YYYYMM) to finalize');return}
   showMsg('Triggering finalize...');
   try{
     const r=await fetch(`/api/finalize/${m}`,{method:'POST',headers:{'X-API-Token':apiToken()}});
     const d=await r.json();
-    showMsg(`Finalize: ${d.status}`);
+    if(r.ok) showMsg(`Finalize: ${d.status}`);
+    else showMsg(`Finalize failed (HTTP ${r.status}): ${d.error||d.message}`);
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
 }
 
 async function doAcknowledge(month){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
   if(!confirm(`Mark month ${month} finalize as OK after review?`))return;
   try{
     const r=await fetch(`/api/finalize/${month}/acknowledge`,{method:'POST',headers:{'X-API-Token':apiToken()}});
     const d=await r.json();
     if(d.ok) showMsg(`${month} marked as OK (acknowledged)`);
-    else showMsg(`Failed: ${d.error||d.message}`);
+    else showMsg(`Acknowledge failed (HTTP ${r.status}): ${d.error||d.message}`);
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
 }
 
 async function doReset(taskId,srv){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
   if(!confirm(`Reset task ${taskId} (${srv}) to 'new'?`))return;
   try{
     const r=await fetch(`/api/tasks/${taskId}/reset`,{method:'POST',headers:{'X-API-Token':apiToken()}});
     const d=await r.json();
     if(d.ok) showMsg(`Task ${taskId} reset`);
-    else showMsg(`Reset failed: ${d.error||d.message}`);
+    else showMsg(`Reset failed (HTTP ${r.status}): ${d.error||d.message}`);
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
 }
