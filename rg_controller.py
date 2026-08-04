@@ -40,6 +40,8 @@ API_TOKEN = os.environ.get("API_TOKEN", "")
 # ClickHouse — cross-validation
 CH_COMPARE_LOCAL_HOST = os.environ.get("CH_COMPARE_LOCAL_HOST", "23.105.14.193")
 CH_COMPARE_LOCAL_DB = os.environ.get("CH_COMPARE_LOCAL_DB", "monthly_ranking")
+CH_COMPARE_LOCAL_USER = os.environ.get("CH_COMPARE_LOCAL_USER", "default")
+CH_COMPARE_LOCAL_PASSWORD = os.environ.get("CH_COMPARE_LOCAL_PASSWORD", "")
 CH_COMPARE_CLOUD_HOST = os.environ.get("CH_COMPARE_CLOUD_HOST", "173.236.65.154")
 CH_COMPARE_CLOUD_USER = os.environ.get("CH_COMPARE_CLOUD_USER", "default")
 CH_COMPARE_CLOUD_PASSWORD = os.environ.get("CH_COMPARE_CLOUD_PASSWORD", "")
@@ -216,7 +218,10 @@ def run_comparison(target_month):
 
     try:
         local_client = clickhouse_driver.Client(
-            host=CH_COMPARE_LOCAL_HOST, connect_timeout=30
+            host=CH_COMPARE_LOCAL_HOST,
+            user=CH_COMPARE_LOCAL_USER,
+            password=CH_COMPARE_LOCAL_PASSWORD,
+            connect_timeout=30,
         )
     except Exception as exc:
         print(f"[COMPARE] Failed to connect to local ClickHouse: {exc}")
