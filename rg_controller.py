@@ -17,12 +17,12 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import clickhouse_driver
 import requests
 from dotenv import load_dotenv
-from flask import Flask, g, jsonify, render_template_string, request
+from flask import Flask, g, jsonify, redirect, render_template_string, request, url_for
 
 # ============================================================
 # Config
@@ -170,7 +170,8 @@ def init_db():
 # Helpers
 # ============================================================
 def _now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Store timestamps in UTC so clients in any timezone can compare them.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _valid_month(month):
@@ -305,6 +306,11 @@ def run_comparison(target_month):
 @app.route("/api/ping")
 def ping():
     return jsonify({"status": "ok", "timestamp": _now()})
+
+
+@app.route("/")
+def index():
+    return redirect(url_for("dashboard"))
 
 
 # ---- Task CRUD ----
@@ -745,12 +751,14 @@ def status():
 def workers():
     db = get_db()
     rows = db.execute("SELECT * FROM worker_heartbeat ORDER BY server").fetchall()
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     result = []
     for r in rows:
         d = dict(r)
         try:
-            last = datetime.strptime(r["last_seen"], "%Y-%m-%d %H:%M:%S")
+            last = datetime.strptime(
+                r["last_seen"], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
             d["online"] = (now - last).total_seconds() < 900  # 15 min
         except (ValueError, TypeError):
             d["online"] = False
@@ -998,7 +1006,7 @@ def background_loop():
             last_timeout_check = now
             try:
                 conn = _get_db_thread()
-                cutoff = (datetime.now() - timedelta(hours=TASK_TIMEOUT_HOURS)).strftime(
+                cutoff = (datetime.now(timezone.utc) - timedelta(hours=TASK_TIMEOUT_HOURS)).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
                 rows = conn.execute(
@@ -1247,7 +1255,7 @@ async function fetchStatus(){
     const workerMap={};
     workers.forEach(w=>{
       let last=null;
-      if(w.last_seen){last=new Date(w.last_seen.replace(' ','T'))}
+      if(w.last_seen){last=new Date(w.last_seen.replace(' ','T')+'Z')}
       w.online = last && (now-last)<900000;
       if(w.online) online++;
       workerMap[w.server]=w;
