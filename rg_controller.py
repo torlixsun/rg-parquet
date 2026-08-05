@@ -1142,7 +1142,6 @@ table.tbl td.warn{color:var(--yellow)}
 <header>
   <div>
     <h1>RG Export <span>Dashboard</span></h1>
-    <div style="font-size:.76rem;color:var(--muted);margin-top:2px">Polling Architecture &middot; No Celery &middot; No Redis</div>
   </div>
   <div class="refresh-badge"><span class="refresh-dot"></span> Live &middot; 30s</div>
 </header>
