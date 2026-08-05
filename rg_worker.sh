@@ -137,11 +137,16 @@ ch_count() {
 # Step 1: Send heartbeat
 # ============================================================
 MY_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
-curl -sf -X POST "${CONTROLLER_URL}/api/heartbeat" \
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${CONTROLLER_URL}/api/heartbeat" \
     -H "Content-Type: application/json" \
     -H "X-API-Token: ${API_TOKEN}" \
     -d "{\"server\": \"${SERVER_NAME}\", \"hostname\": \"$(hostname)\", \"ip\": \"${MY_IP}\"}" \
-    >/dev/null 2>&1 || true
+    2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ]; then
+    log "Heartbeat OK (${SERVER_NAME})"
+else
+    log "WARNING: Heartbeat failed (HTTP ${HTTP_CODE}) to ${CONTROLLER_URL} — worker may appear offline"
+fi
 
 # ============================================================
 # Step 2: Poll for new task
