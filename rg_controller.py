@@ -606,12 +606,18 @@ def get_table_statuses(task_id):
 
 @app.route("/api/tasks/<int:task_id>/reset", methods=["POST"])
 def reset_task(task_id):
-    """Reset task to 'new' (for retry after failure/timeout)."""
+    """Reset task to 'new' (for retry after failure/timeout).
+
+    Pass {"force": true} to also reset a task stuck in 'progress'
+    (only when the worker is confirmed dead/stuck).
+    """
     auth_err = _check_auth()
     if auth_err:
         return auth_err
 
     db = get_db()
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force")) or request.args.get("force") in ("1", "true", "yes")
 
     # Verify task exists
     task = db.execute("SELECT * FROM task_status WHERE id=?", (task_id,)).fetchone()
@@ -619,12 +625,13 @@ def reset_task(task_id):
         return jsonify({"error": "Task not found"}), 404
 
     # Refuse to reset a task currently being worked on
-    if task["status"] == "progress":
+    if task["status"] == "progress" and not force:
         return (
             jsonify(
                 {
                     "error": "Cannot reset a task in 'progress' state. "
-                    "Wait for the worker to finish or for the task to timeout."
+                    "Wait for the worker to finish or for the task to timeout. "
+                    "Pass force=true to override (only if the worker is dead/stuck)."
                 }
             ),
             409,
@@ -1285,8 +1292,9 @@ async function fetchStatus(){
       }
       const onlineDot = w && w.online;
       const sCls = status==='idle'?'':`s-${status}`;
-      const resetBtn=(status==='failed'||status==='timeout')?
-        ` <button onclick="event.stopPropagation();doReset(${t.id},'${srv}')" style="font-size:.6rem;padding:1px 8px;border-radius:8px;border:1px solid var(--red);background:var(--red-bg);color:var(--red);cursor:pointer;margin-left:4px" title="Reset task to 'new' for retry">Retry</button>`:'';
+      const showReset = t && (status==='failed'||status==='timeout'||status==='progress'||status==='complete');
+      const resetBtn = showReset ?
+        `<button onclick="event.stopPropagation();doReset(${t.id},'${srv}','${status}')" style="font-size:.6rem;padding:1px 8px;border-radius:8px;border:1px solid ${status==='progress'?'#f59e0b':(status==='complete'?'var(--muted)':'var(--red)')};background:${status==='progress'?'rgba(245,158,11,.12)':(status==='complete'?'var(--surface2)':'var(--red-bg)')};color:${status==='progress'?'#f59e0b':(status==='complete'?'var(--muted)':'var(--red)')};cursor:pointer;margin-left:4px" title="${status==='progress'?'Force reset a stuck task (worker dead only)':'Reset task to new for re-run'}">${(status==='failed'||status==='timeout')?'Retry':'Reset'}</button>`:'';
       html+=`<div class="server-card ${sCls}" onclick="toggleDetail('${srv}',${t?t.id:'null'})">
         <div class="server-name">${srv} ${onlineDot?'<span style="color:var(--green);font-size:.6rem">●</span>':'<span style="color:var(--red);font-size:.6rem">○</span>'}${resetBtn}</div>
         <div class="server-status"><span class="server-dot ${status==='idle'?'':status}"></span>${status}</div>
@@ -1416,11 +1424,15 @@ async function doAcknowledge(month){
   }catch(e){showMsg('Error: '+e.message)}
 }
 
-async function doReset(taskId,srv){
+async function doReset(taskId,srv,status){
   if(!apiToken()){showMsg('Enter the API Token first');return}
-  if(!confirm(`Reset task ${taskId} (${srv}) to 'new'?`))return;
+  const force = status==='progress';
+  const msg = force
+    ? `Task ${taskId} (${srv}) is still in progress.\nForce-reset will make it run again. Only do this if the worker is dead/stuck (e.g. crashed mid-export).\n\nContinue?`
+    : `Reset task ${taskId} (${srv}) to 'new' and re-run?\nAlready-uploaded tables will be skipped.`;
+  if(!confirm(msg))return;
   try{
-    const r=await fetch(`/api/tasks/${taskId}/reset`,{method:'POST',headers:{'X-API-Token':apiToken()}});
+    const r=await fetch(`/api/tasks/${taskId}/reset`,{method:'POST',headers:{'Content-Type':'application/json','X-API-Token':apiToken()},body:JSON.stringify({force})});
     const d=await r.json();
     if(d.ok) showMsg(`Task ${taskId} reset`);
     else showMsg(`Reset failed (HTTP ${r.status}): ${d.error||d.message}`);
