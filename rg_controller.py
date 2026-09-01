@@ -1361,7 +1361,7 @@ async function toggleDetail(srv,taskId){
       else if(t.status==='failed') cls='err';
       else if(t.status==='skipped') cls='';
       else cls='warn';
-      h+=`<tr><td style="font-size:.66rem">${t.table_name.replace(/_\d{6}_/,'_XX_')}</td><td class="${cls}">${t.status}</td><td>${t.rows_local||0}</td><td>${t.rows_s3||0}</td></tr>`;
+      h+=`<tr><td style="font-size:.66rem">${t.table_name}</td><td class="${cls}">${t.status}</td><td>${t.rows_local||0}</td><td>${t.rows_s3||0}</td></tr>`;
     });
     h+='</table>';
     bodyEl.innerHTML=h;
