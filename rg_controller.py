@@ -10,6 +10,8 @@ Deploy on tools-1:
     # or: ./start_controller.sh
 """
 
+import csv
+import io
 import json
 import hmac
 import os
@@ -1362,6 +1364,73 @@ def get_sync(month):
     return jsonify({"month": month, "sync": _serialize_sync_row(row)})
 
 
+@app.route("/api/sync/<month>/export.csv", methods=["GET"])
+def export_sync_csv(month):
+    """Download the most recent sync_log row for <month> as CSV.
+
+    Always CSV — never needs auth because it contains no secrets (only
+    counts, statuses, timings, file names).
+    """
+    if not _valid_month(month):
+        return "Invalid month", 400
+    db = get_db()
+    row = db.execute("SELECT * FROM sync_log WHERE month=?", (month,)).fetchone()
+    if not row:
+        return "not_found", 404
+
+    s = _serialize_sync_row(row)
+    recs = s.get("details_obj", [])
+    stats = s.get("stats") or {}
+    mode = stats.get("mode", "") or ""
+
+    buf = io.StringIO()
+    # Header columns — include src_* only when mode says we queried source
+    # (or when mode is unknown / "both" / empty, safest to include everything).
+    show_src = mode in ("", "src", "both")
+    show_dst = mode in ("", "dst", "both")
+
+    header = ["table", "file", "status", "src_size_bytes", "dst_size_bytes"]
+    if show_src:
+        header += ["src_count", "src_ms"]
+    if show_dst:
+        header += ["dst_count", "dst_ms"]
+    header += ["copy_ms", "diff", "src_err", "dst_err", "error"]
+
+    w = csv.writer(buf)
+    w.writerow(header)
+    for r in recs:
+        row_out = [
+            r.get("table", ""),
+            r.get("file", ""),
+            r.get("status", ""),
+            r.get("src_size_bytes", ""),
+            r.get("dst_size_bytes", ""),
+        ]
+        if show_src:
+            row_out += [r.get("src_count", ""), r.get("src_ms", "")]
+        if show_dst:
+            row_out += [r.get("dst_count", ""), r.get("dst_ms", "")]
+        row_out += [
+            r.get("copy_ms", ""),
+            r.get("diff", ""),
+            r.get("src_err", ""),
+            r.get("dst_err", ""),
+            r.get("error", ""),
+        ]
+        w.writerow(row_out)
+
+    csv_bytes = buf.getvalue().encode("utf-8-sig")  # BOM so Excel opens UTF-8 correctly
+    fname = f"rg-sync-{month}-{s.get('status','?')}.csv"
+    return app.response_class(
+        csv_bytes,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Length": str(len(csv_bytes)),
+        },
+    )
+
+
 def _serialize_sync_row(row):
     """Turn a sqlite sync_log row into a JSON-friendly dict.
 
@@ -1939,6 +2008,10 @@ async function fetchStatus(){
             if(sync.status==='validate_only'){
               sHtml+=`<span style="font-size:.62rem;background:#7c3aed;color:#fff;padding:2px 8px;border-radius:10px;margin-left:6px">validate_only</span>`;
             }
+            // Export button — always visible so users can download mid-run
+            // or after completion.  CSV contains no secrets so no API token
+            // needed.
+            sHtml+=`<button class="btn-primary btn-header" style="margin-left:auto" onclick="downloadSyncCSV('${d.month}')">Download CSV</button>`;
             sHtml+='</div>';
 
             // Timestamps
@@ -2235,6 +2308,19 @@ async function doValidate(){
     }
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
+}
+
+function downloadSyncCSV(month){
+  // CSV is public (no secrets) — just trigger a browser download.
+  // Using window.open so we don't lose the dashboard state.
+  const url = `/api/sync/${month}/export.csv`;
+  showMsg(`Downloading ${url}...`);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';  // let server's Content-Disposition decide filename
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 async function doReset(taskId,srv,status){
