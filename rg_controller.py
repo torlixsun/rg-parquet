@@ -2013,28 +2013,82 @@ async function fetchStatus(){
               const showSrc = (mode==='' || mode==='src' || mode==='both');
               const showDst = (mode==='' || mode==='dst' || mode==='both');
 
-              sHtml+='<div class="fin-detail"><table><tr>'+
-                     '<th>Table</th><th>File</th><th>Status</th>'+
-                     '<th>size</th>'+
-                     (showSrc?'<th>src_count</th><th>src_ms</th>':'')+
-                     (showDst?'<th>dst_count</th><th>dst_ms</th>':'')+
-                     '<th>copy_ms</th></tr>';
+              // --- Group by table name so 12 lweb-rg-*.parquet per table
+              // collapse into a single collapsible block instead of 192 flat
+              // rows that make the card unreadable.
+              const groups = {};
               recs.forEach(r=>{
-                let cls='';
-                if(r.status==='verified'||r.status==='skipped')cls='ok';
-                else if(r.status==='mismatch')cls='warn';
-                else cls='err';
-                const fmt=(v)=>v===undefined||v===null?'—':v;
-                const msFmt=(v)=>v===undefined||v===null?'—':v+'ms';
-                sHtml+=`<tr><td style="font-size:.62rem">${r.table||''}</td>`+
-                       `<td style="font-size:.62rem;font-family:JetBrains Mono,monospace">${r.file||''}</td>`+
-                       `<td class="${cls}">${r.status}</td>`+
-                       `<td>${fmt(r.src_size_bytes)}</td>`+
-                       (showSrc?`<td>${fmt(r.src_count)}</td><td>${msFmt(r.src_ms)}</td>`:'')+
-                       (showDst?`<td>${fmt(r.dst_count)}</td><td>${msFmt(r.dst_ms)}</td>`:'')+
-                       `<td>${msFmt(r.copy_ms)}</td></tr>`;
+                const t = r.table || '(unknown)';
+                if(!groups[t]) groups[t] = [];
+                groups[t].push(r);
               });
-              sHtml+='</table></div>';
+              const fmt=(v)=>v===undefined||v===null?'—':v;
+              const msFmt=(v)=>v===undefined||v===null?'—':v+'ms';
+
+              sHtml+='<div class="fin-detail">';
+              Object.entries(groups).sort(([a],[b])=>a.localeCompare(b)).forEach(([table,rows])=>{
+                let gV=0, gS=0, gM=0, gF=0, gX=0;
+                rows.forEach(r=>{
+                  if(r.status==='verified')gV++;
+                  else if(r.status==='skipped')gS++;
+                  else if(r.status==='mismatch')gM++;
+                  else if(r.status==='missing_on_target')gX++;
+                  else gF++;
+                });
+                const totalFiles = rows.length;     // how many of the table's files we processed so far
+                // Expect 12 files per table (12 servers); if we see fewer the
+                // run is still mid-table.
+                const expFiles = 12;
+                const gPct = Math.round(totalFiles/expFiles*100);
+
+                // Group-level status pill color — red if any mismatch/fail/missing,
+                // yellow if any non-verified, green only when all verified/skipped.
+                let gPillCls = 'ok';
+                if(gF||gM||gX) gPillCls = 'err';
+                else if(!gV && !gS) gPillCls = 'info';
+
+                sHtml+=`<details open style="margin-bottom:10px;border:1px solid var(--border);border-radius:6px;background:var(--surface);overflow:hidden">`;
+                sHtml+=`<summary style="cursor:pointer;padding:8px 12px;font-size:.78rem;font-weight:600;background:var(--border);list-style:none;display:flex;align-items:center;gap:10px">`;
+                sHtml+=`<span style="font-size:.72rem;color:var(--muted);margin-right:2px">▾</span>`;
+                sHtml+=`<span style="font-family:JetBrains Mono,monospace">${table}</span>`;
+                sHtml+=`<span style="margin-left:auto;display:flex;gap:10px;font-size:.68rem;color:var(--muted)">`;
+                sHtml+=`<span><b style="color:var(--fg)">${totalFiles}/${expFiles}</b></span>`;
+                sHtml+=`<span class="pill ${gPillCls}" style="font-size:.6rem">verified ${gV}</span>`;
+                if(gS)sHtml+=`<span class="pill info" style="font-size:.6rem">skipped ${gS}</span>`;
+                if(gM)sHtml+=`<span class="pill warn" style="font-size:.6rem">mismatch ${gM}</span>`;
+                if(gF)sHtml+=`<span class="pill err" style="font-size:.6rem">failed ${gF}</span>`;
+                if(gX)sHtml+=`<span class="pill err" style="font-size:.6rem">missing ${gX}</span>`;
+                sHtml+=`</span></summary>`;
+
+                // Per-file rows inside the group
+                sHtml+='<table style="font-size:.65rem;margin:0"><tr>'+
+                       '<th style="text-align:left;padding:4px 8px">File</th>'+
+                       '<th style="text-align:left;padding:4px 8px">Status</th>'+
+                       '<th style="text-align:right;padding:4px 8px">size</th>'+
+                       (showSrc?'<th style="text-align:right;padding:4px 8px">src_count</th>'+
+                                '<th style="text-align:right;padding:4px 8px">src_ms</th>':'')+
+                       (showDst?'<th style="text-align:right;padding:4px 8px">dst_count</th>'+
+                                '<th style="text-align:right;padding:4px 8px">dst_ms</th>':'')+
+                       '<th style="text-align:right;padding:4px 8px">copy_ms</th></tr>';
+                rows.forEach(r=>{
+                  let cls='';
+                  if(r.status==='verified'||r.status==='skipped')cls='ok';
+                  else if(r.status==='mismatch')cls='warn';
+                  else cls='err';
+                  sHtml+=`<tr>`+
+                         `<td style="padding:3px 8px;font-family:JetBrains Mono,monospace">${r.file||''}</td>`+
+                         `<td style="padding:3px 8px" class="${cls}">${r.status}</td>`+
+                         `<td style="padding:3px 8px;text-align:right">${fmt(r.src_size_bytes)}</td>`+
+                         (showSrc?`<td style="padding:3px 8px;text-align:right">${fmt(r.src_count)}</td>`+
+                                  `<td style="padding:3px 8px;text-align:right">${msFmt(r.src_ms)}</td>`:'')+
+                         (showDst?`<td style="padding:3px 8px;text-align:right">${fmt(r.dst_count)}</td>`+
+                                  `<td style="padding:3px 8px;text-align:right">${msFmt(r.dst_ms)}</td>`:'')+
+                         `<td style="padding:3px 8px;text-align:right">${msFmt(r.copy_ms)}</td>`+
+                         `</tr>`;
+                });
+                sHtml+='</table></details>';
+              });
+              sHtml+='</div>';
             }
             if(sync.error_msg){
               sHtml+=`<div class="err" style="font-size:.7rem;margin-top:8px">Error: ${sync.error_msg}</div>`;
