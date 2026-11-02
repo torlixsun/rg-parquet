@@ -430,18 +430,25 @@ def _ch_for_sync():
 _sync_lock = threading.Lock()
 
 
-def run_sync(target_month, validate_query=None):
+def run_sync(target_month, validate_query=None, action="sync"):
     """Mirror  Seagate rg-datalake-<year>/<table>/*.parquet  →  target cloud.
+
+    action can be:
+      "sync"          full copy + validate (default)
+      "validate_only" skip cross-provider copy, only run ClickHouse count()
+                      on files that already exist on the target cloud.
+                      Missing files on the target are flagged as
+                      "missing_on_target" and counted as failed.
 
     validate_query overrides SYNC_VALIDATE_QUERY for this run when given.
     Thread-safe — serialised by _sync_lock; callers can invoke from API or
     background.  Returns dict summarising the run.
     """
     with _sync_lock:
-        return _run_sync_locked(target_month, validate_query)
+        return _run_sync_locked(target_month, validate_query, action)
 
 
-def _run_sync_locked(target_month, validate_query):
+def _run_sync_locked(target_month, validate_query, action="sync"):
     year = target_month[:4]
     src_bucket = f"rg-datalake-{year}"
     # SYNC_TARGET_BUCKET can be either a plain bucket name OR a template that
@@ -458,6 +465,9 @@ def _run_sync_locked(target_month, validate_query):
     if mode not in ("none", "src", "dst", "both"):
         return {"status": "blocked", "error": f"Invalid validate_query {mode!r}", "month": target_month}
 
+    if action not in ("sync", "validate_only"):
+        return {"status": "blocked", "error": f"Invalid action {action!r}", "month": target_month}
+
     now = _now()
     conn = _get_db_thread()
     try:
@@ -467,10 +477,11 @@ def _run_sync_locked(target_month, validate_query):
             return {"status": "already_running", "month": target_month,
                     "sync_id": existing["id"]}
 
+        label = "validate_only" if action == "validate_only" else "running"
         conn.execute(
             "INSERT OR REPLACE INTO sync_log (month, status, details, created_at, started_at, completed_at) "
-            "VALUES (?, 'running', '[]', ?, ?, NULL)",
-            (target_month, now, now),
+            "VALUES (?, ?, '[]', ?, ?, NULL)",
+            (target_month, label, now, now),
         )
         conn.commit()
         sync_row = conn.execute("SELECT id FROM sync_log WHERE month=?", (target_month,)).fetchone()
@@ -483,27 +494,22 @@ def _run_sync_locked(target_month, validate_query):
         if mode != "none":
             try:
                 ch = _ch_for_sync()
-                # Smoke-test — a no-op SELECT so we fail early if CH is unreachable.
                 ch.execute("SELECT 1")
             except Exception as exc:
                 _persist_sync(conn, sync_id, "failed", [], now, _now(),
                               f"validation ClickHouse unavailable: {exc}")
                 return {"status": "failed", "error": f"validation ClickHouse unavailable: {exc}"}
 
-        src_prefix = ""   # list everything in rg-datalake-YYYY, year/table/file keys will follow
         details = []
-
         total_ok = 0
         total_mismatch = 0
         total_failed = 0
         total_skipped = 0
+        total_missing = 0
 
-        # Iterate all tables for this month (so we only touch files that should exist
-        # for this month — avoids copying left-over files from other months).
         for tpl in RG_TABLES:
             table = tpl.format(m=target_month)
             table_prefix = f"{table}/"
-            # Skip empty table folders — list_objects_v2 on a missing prefix is just empty.
             files = list(_s3_list_parquets(src, src_bucket, table_prefix))
             if not files:
                 continue
@@ -514,40 +520,51 @@ def _run_sync_locked(target_month, validate_query):
 
                 dst_key = f"{dst_prefix}/{key}" if dst_prefix else key
 
-                # --- Idempotent skip: target exists and same size ---
                 dst_size = _s3_head_size(dst, dst_bucket, dst_key)
-                if dst_size is not None and dst_size == src_size:
-                    record["status"] = "skipped"
-                    total_skipped += 1
-                else:
-                    # --- Copy ---
-                    t0 = time.perf_counter()
-                    try:
-                        dst.copy(
-                            CopySource={"Bucket": src_bucket, "Key": key},
-                            Bucket=dst_bucket, Key=dst_key,
-                        )
-                        record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
-                    except Exception as exc:
-                        record["status"] = "copy_failed"
-                        record["error"] = str(exc)[:500]
-                        record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
-                        total_failed += 1
-                        details.append(record)
-                        _flush_sync_details(conn, sync_id, details)
-                        continue
 
-                    # Re-check — make sure the copy landed with the right size.
-                    new_dst_size = _s3_head_size(dst, dst_bucket, dst_key)
-                    record["dst_size_bytes"] = new_dst_size
-                    if new_dst_size is None or new_dst_size != src_size:
-                        record["status"] = "copy_failed"
-                        record["error"] = (f"post-copy size mismatch: src={src_size} "
-                                           f"dst={new_dst_size}")
+                if action == "validate_only":
+                    # Validate-only mode: skip copy entirely.  If the file is
+                    # missing on the target we flag it and move on — no copy.
+                    if dst_size is None:
+                        record["status"] = "missing_on_target"
+                        total_missing += 1
                         total_failed += 1
                         details.append(record)
                         _flush_sync_details(conn, sync_id, details)
                         continue
+                    record["dst_size_bytes"] = dst_size
+                else:
+                    # --- Full sync: copy if missing or size differs ---
+                    if dst_size is not None and dst_size == src_size:
+                        record["status"] = "skipped"
+                        total_skipped += 1
+                    else:
+                        t0 = time.perf_counter()
+                        try:
+                            dst.copy(
+                                CopySource={"Bucket": src_bucket, "Key": key},
+                                Bucket=dst_bucket, Key=dst_key,
+                            )
+                            record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
+                        except Exception as exc:
+                            record["status"] = "copy_failed"
+                            record["error"] = str(exc)[:500]
+                            record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
+                            total_failed += 1
+                            details.append(record)
+                            _flush_sync_details(conn, sync_id, details)
+                            continue
+
+                        new_dst_size = _s3_head_size(dst, dst_bucket, dst_key)
+                        record["dst_size_bytes"] = new_dst_size
+                        if new_dst_size is None or new_dst_size != src_size:
+                            record["status"] = "copy_failed"
+                            record["error"] = (f"post-copy size mismatch: src={src_size} "
+                                               f"dst={new_dst_size}")
+                            total_failed += 1
+                            details.append(record)
+                            _flush_sync_details(conn, sync_id, details)
+                            continue
 
                 # --- Validation (count WHERE <filter>) ---
                 if mode == "none":
@@ -606,6 +623,7 @@ def _run_sync_locked(target_month, validate_query):
                 details.append(record)
                 _flush_sync_details(conn, sync_id, details)
 
+        # Final status
         if total_failed == 0 and total_mismatch == 0:
             fin_status = "success"
         elif total_failed == 0:
@@ -1197,14 +1215,17 @@ def acknowledge_finalize(month):
 # ---- Sync ----
 @app.route("/api/sync/<month>", methods=["POST"])
 def start_sync(month):
-    """Manually trigger a Seagate → target cloud mirror for <month>.
+    """Manually trigger a Seagate → target cloud mirror or validate pass.
 
     Async — spins up a background thread, returns immediately with the
-    current sync_log row.  Body (optional):
+    current sync_log row.  Body (all optional):
 
         {
-          "validate_query": "both"   // overrides SYNC_VALIDATE_QUERY
-                                      //   none | src | dst | both
+          "validate_query": "both",       // overrides SYNC_VALIDATE_QUERY
+                                             //   none | src | dst | both
+          "action": "sync"                // "sync" (full copy+validate, default)
+                                             //   or "validate_only" (skip copy,
+                                             //   run count() on already-synced files)
         }
     """
     auth_err = _check_auth()
@@ -1216,6 +1237,7 @@ def start_sync(month):
 
     body = request.get_json(silent=True) or {}
     vq = (body.get("validate_query") or "").strip().lower() or None
+    action = (body.get("action") or "sync").strip().lower()
 
     ok, err = _validate_sync()
     if not ok:
@@ -1231,14 +1253,14 @@ def start_sync(month):
             "sync": _serialize_sync_row(existing),
         })
 
-    # Kick off in a daemon thread so the request returns immediately.
     t = threading.Thread(
-        target=_run_sync_locked, args=(month, vq), daemon=True,
+        target=_run_sync_locked, args=(month, vq, action), daemon=True,
     )
     t.start()
 
     return jsonify({
         "status": "started", "month": month,
+        "action": action,
         "validate_query": vq or SYNC_VALIDATE_QUERY,
     })
 
@@ -1641,6 +1663,7 @@ table.tbl td.warn{color:var(--yellow)}
     <button class="btn-primary" onclick="doDispatch()">Dispatch</button>
     <button class="btn-danger" onclick="doFinalize()">Finalize</button>
     <button class="btn-primary" onclick="doSync()" title="Mirror parquet files to target S3-compatible cloud">Sync</button>
+    <button class="btn-primary" onclick="doValidate()" style="background:#a855f7" title="Validate existing files on target cloud WITHOUT re-copying">Validate</button>
     <select id="sync-validate" title="Which side(s) to validate">
       <option value="none">validate: none</option>
       <option value="src">validate: src</option>
@@ -1968,7 +1991,7 @@ async function doSync(){
     const r=await fetch(`/api/sync/${m}`,{
       method:'POST',
       headers:{'Content-Type':'application/json','X-API-Token':apiToken()},
-      body:JSON.stringify({validate_query:vq}),
+      body:JSON.stringify({validate_query:vq, action:'sync'}),
     });
     const d=await r.json();
     if(r.ok){
@@ -1977,6 +2000,30 @@ async function doSync(){
       else showMsg(`Sync: ${d.status}`);
     } else {
       showMsg(`Sync failed (HTTP ${r.status}): ${d.error||d.message}`);
+    }
+    fetchStatus();
+  }catch(e){showMsg('Error: '+e.message)}
+}
+
+async function doValidate(){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
+  const m=document.getElementById('dispatch-month').value.trim();
+  if(!m){showMsg('Enter a month (YYYYMM) to validate');return}
+  const vq=document.getElementById('sync-validate').value;
+  showMsg('Starting validate (no copy)...');
+  try{
+    const r=await fetch(`/api/sync/${m}`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-API-Token':apiToken()},
+      body:JSON.stringify({validate_query:vq, action:'validate_only'}),
+    });
+    const d=await r.json();
+    if(r.ok){
+      if(d.status==='started') showMsg(`Validate started for ${m} (validate=${vq||'both'})`);
+      else if(d.status==='already_running') showMsg(`A sync/validate run is already active for ${m}`);
+      else showMsg(`Validate: ${d.status}`);
+    } else {
+      showMsg(`Validate failed (HTTP ${r.status}): ${d.error||d.message}`);
     }
     fetchStatus();
   }catch(e){showMsg('Error: '+e.message)}
