@@ -72,7 +72,7 @@ SYNC_TARGET_BUCKET = os.environ.get("SYNC_TARGET_BUCKET", "")
 SYNC_TARGET_PREFIX = os.environ.get("SYNC_TARGET_PREFIX", "").strip("/")
 
 SYNC_VALIDATE_QUERY = os.environ.get("SYNC_VALIDATE_QUERY", "both").strip().lower()
-SYNC_VALIDATE_FILTER = os.environ.get("SYNC_VALIDATE_FILTER", "domain = 'amazon.com'").strip()
+SYNC_VALIDATE_FILTER = os.environ.get("SYNC_VALIDATE_FILTER", "root_domain_reverse = 'com.amazon'").strip()
 CH_SYNC_VALIDATE_HOST = os.environ.get("CH_SYNC_VALIDATE_HOST", "").strip()
 CH_SYNC_VALIDATE_USER = os.environ.get("CH_SYNC_VALIDATE_USER", "").strip()
 CH_SYNC_VALIDATE_PASSWORD = os.environ.get("CH_SYNC_VALIDATE_PASSWORD", "")
