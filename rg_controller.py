@@ -681,8 +681,8 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
 
         # Pack total known count into stats so the Dashboard progress bar has
         # an exact denominator instead of the 192 fallback guess.
-        _persist_sync(conn, sync_id, fin_status, details, now, _now(), summary=None,
-                      extra={"total": len(details), "ok": total_ok,
+        _persist_sync(conn, sync_id, fin_status, details, now, _now(),
+                      extra={"mode": mode, "total": len(details), "ok": total_ok,
                              "mismatch": total_mismatch, "failed": total_failed,
                              "skipped": total_skipped, "missing": total_missing})
 
@@ -2000,11 +2000,24 @@ async function fetchStatus(){
             }
 
             if(recs.length){
+              // Which columns to show based on validate mode.  mode lives in
+              // stats.mode (packed at run end), but during an active run stats
+              // is empty — so we fall back to inspecting the FIRST record's
+              // keys: if it has src_count we ran src; if it has dst_count we
+              // ran dst.  No mode info at all → show everything (older rows).
+              let mode = (stats && stats.mode) || '';
+              if(!mode && recs.length){
+                if(recs[0].src_count!==undefined) mode='src';
+                if(recs[0].dst_count!==undefined) mode=(mode==='src'?'both':'dst');
+              }
+              const showSrc = (mode==='' || mode==='src' || mode==='both');
+              const showDst = (mode==='' || mode==='dst' || mode==='both');
+
               sHtml+='<div class="fin-detail"><table><tr>'+
                      '<th>Table</th><th>File</th><th>Status</th>'+
                      '<th>size</th>'+
-                     '<th>src_count</th><th>src_ms</th>'+
-                     '<th>dst_count</th><th>dst_ms</th>'+
+                     (showSrc?'<th>src_count</th><th>src_ms</th>':'')+
+                     (showDst?'<th>dst_count</th><th>dst_ms</th>':'')+
                      '<th>copy_ms</th></tr>';
               recs.forEach(r=>{
                 let cls='';
@@ -2017,8 +2030,8 @@ async function fetchStatus(){
                        `<td style="font-size:.62rem;font-family:JetBrains Mono,monospace">${r.file||''}</td>`+
                        `<td class="${cls}">${r.status}</td>`+
                        `<td>${fmt(r.src_size_bytes)}</td>`+
-                       `<td>${fmt(r.src_count)}</td><td>${msFmt(r.src_ms)}</td>`+
-                       `<td>${fmt(r.dst_count)}</td><td>${msFmt(r.dst_ms)}</td>`+
+                       (showSrc?`<td>${fmt(r.src_count)}</td><td>${msFmt(r.src_ms)}</td>`:'')+
+                       (showDst?`<td>${fmt(r.dst_count)}</td><td>${msFmt(r.dst_ms)}</td>`:'')+
                        `<td>${msFmt(r.copy_ms)}</td></tr>`;
               });
               sHtml+='</table></div>';
