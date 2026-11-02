@@ -15,8 +15,10 @@ import hmac
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import boto3
@@ -337,17 +339,39 @@ def run_comparison(target_month):
 # ============================================================
 # Sync  —  Seagate  →  target S3-compatible cloud
 # ============================================================
+# Ambient AWS env vars (AWS_PROFILE / AWS_DEFAULT_PROFILE / AWS_CONFIG_FILE /
+# AWS_SHARED_CREDENTIALS_FILE) can boto3's default session into a profile
+# that doesn't exist (e.g. ProfileNotFound: "wasabi" on the controller host).
+# We pop these inside _boto_client so every client instance uses ONLY the
+# inline creds we hand it — no shared config, no profile, no surprises.
+_AWS_ENV_VARS = ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_CONFIG_FILE",
+                "AWS_SHARED_CREDENTIALS_FILE", "AWS_ROLE_ARN",
+                "AWS_WEB_IDENTITY_TOKEN_FILE")
+
+
 def _boto_client(endpoint, key, secret):
-    """Build a boto3 S3 client for any S3-compatible provider."""
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=key,
-        aws_secret_access_key=secret,
-        region_name="us-east-1",
-        config=botocore.config.Config(signature_version="s3v4",
-                                      connect_timeout=15, retries={"max_attempts": 3}),
-    )
+    """Build a boto3 S3 client for any S3-compatible provider.
+
+    Purges all AWS_PROFILE-style env vars before creating the client so it
+    cannot fall back to a nonexistent shared profile.  Credentials come
+    exclusively from the Seagate / SYNC_TARGET_* config in .env.
+    """
+    saved = {}
+    for v in _AWS_ENV_VARS:
+        if v in os.environ:
+            saved[v] = os.environ.pop(v)
+    try:
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=key,
+            aws_secret_access_key=secret,
+            region_name="us-east-1",
+            config=botocore.config.Config(signature_version="s3v4",
+                                          connect_timeout=15, retries={"max_attempts": 3}),
+        )
+    finally:
+        os.environ.update(saved)
 
 
 def _s3_list_parquets(client, bucket, prefix):
@@ -1291,9 +1315,31 @@ def start_sync(month):
             "sync": _serialize_sync_row(existing),
         })
 
-    t = threading.Thread(
-        target=_run_sync_locked, args=(month, vq, action), daemon=True,
-    )
+    def _safe_run():
+        """Wrapper so an uncaught exception doesn't kill the daemon thread
+        silently — it gets caught, logged, and the sync row is marked
+        failed so the Dashboard shows something useful instead of a
+        permanent "running" status."""
+        try:
+            _run_sync_locked(month, vq, action)
+        except Exception as exc:
+            traceback.print_exc()
+            print(f"[SYNC] {month} crashed in thread: {exc}", file=sys.stderr)
+            try:
+                conn = _get_db_thread()
+                existing = conn.execute("SELECT id FROM sync_log WHERE month=?", (month,)).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE sync_log SET status='failed', completed_at=?, "
+                        "details=? WHERE id=?",
+                        (_now(), json.dumps({"error": f"thread crashed: {exc}"}), existing["id"]),
+                    )
+                    conn.commit()
+                conn.close()
+            except Exception as _inner:
+                print(f"[SYNC] failed to persist crash row: {_inner}", file=sys.stderr)
+
+    t = threading.Thread(target=_safe_run, daemon=True)
     t.start()
 
     return jsonify({
