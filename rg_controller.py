@@ -19,6 +19,8 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import boto3
+import botocore
 import clickhouse_driver
 import requests
 from dotenv import load_dotenv
@@ -57,6 +59,21 @@ SEAGATE_SECRET = os.environ.get("SEAGATE_SECRET", "")
 SEAGATE_ENDPOINT = os.environ.get(
     "SEAGATE_ENDPOINT", "https://s3.us-east-1.clarity1.lyve.seagate.com"
 )
+
+# ============================================================
+# Sync config  (Seagate → target S3-compatible cloud)
+# ============================================================
+SYNC_TARGET_ENDPOINT = os.environ.get("SYNC_TARGET_ENDPOINT", "")
+SYNC_TARGET_KEY_ID = os.environ.get("SYNC_TARGET_KEY_ID", "")
+SYNC_TARGET_SECRET = os.environ.get("SYNC_TARGET_SECRET", "")
+SYNC_TARGET_BUCKET = os.environ.get("SYNC_TARGET_BUCKET", "")
+SYNC_TARGET_PREFIX = os.environ.get("SYNC_TARGET_PREFIX", "").strip("/")
+
+SYNC_VALIDATE_QUERY = os.environ.get("SYNC_VALIDATE_QUERY", "both").strip().lower()
+SYNC_VALIDATE_FILTER = os.environ.get("SYNC_VALIDATE_FILTER", "domain = 'amazon.com'").strip()
+CH_SYNC_VALIDATE_HOST = os.environ.get("CH_SYNC_VALIDATE_HOST", "").strip()
+CH_SYNC_VALIDATE_USER = os.environ.get("CH_SYNC_VALIDATE_USER", "").strip()
+CH_SYNC_VALIDATE_PASSWORD = os.environ.get("CH_SYNC_VALIDATE_PASSWORD", "")
 
 # 12 servers
 RG_SERVERS = [f"lweb-rg-{i:03d}" for i in range(1, 13)]
@@ -155,6 +172,16 @@ def init_db():
             status      TEXT,
             details     TEXT,
             created_at  TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            month        TEXT UNIQUE,
+            status       TEXT,
+            details      TEXT,
+            created_at   TEXT,
+            started_at   TEXT,
+            completed_at TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_task_month   ON task_status(month);
@@ -298,6 +325,346 @@ def run_comparison(target_month):
         )
 
     return all_ok, details
+
+
+# ============================================================
+# Sync  —  Seagate  →  target S3-compatible cloud
+# ============================================================
+def _boto_client(endpoint, key, secret):
+    """Build a boto3 S3 client for any S3-compatible provider."""
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        region_name="us-east-1",
+        config=botocore.config.Config(signature_version="s3v4",
+                                      connect_timeout=15, retries={"max_attempts": 3}),
+    )
+
+
+def _s3_list_parquets(client, bucket, prefix):
+    """Yield (key, size_bytes) for every .parquet under <prefix>/ in <bucket>.
+
+    Paginates automatically.  Silently skips non-parquet keys.
+    """
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj["Key"]
+            if key.endswith(".parquet"):
+                yield key, int(obj["Size"])
+
+
+def _s3_head_size(client, bucket, key):
+    """Return ContentLength for an S3 key, or None if missing / error."""
+    try:
+        resp = client.head_object(Bucket=bucket, Key=key)
+        return int(resp["ContentLength"])
+    except botocore.exceptions.ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            return None
+        print(f"[SYNC] head_object failed s3://{bucket}/{key}: {exc}")
+        return None
+    except Exception as exc:
+        print(f"[SYNC] head_object failed s3://{bucket}/{key}: {exc}")
+        return None
+
+
+def _clickhouse_s3_count_filtered(url, key, secret, filter_sql, ch_client):
+    """Run  SELECT count() FROM s3('<url>', '<key>', '<secret>', 'Parquet')
+           WHERE <filter_sql>
+    and return  (count: int | None, elapsed_ms: int, err: str | None).
+    """
+    t0 = time.perf_counter()
+    sql = (
+        "SELECT count() FROM s3('%s', '%s', '%s', 'Parquet') WHERE %s"
+        % (url, key, secret, filter_sql)
+    )
+    try:
+        row = ch_client.execute(sql)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        return int(row[0][0]), elapsed_ms, None
+    except Exception as exc:
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        print(f"[SYNC] validation query failed url={url[:120]}...  {exc}")
+        return None, elapsed_ms, str(exc)
+
+
+def _validate_sync():
+    """Runtime checks; returns (ok: bool, err: str | None)."""
+    missing = [
+        name for name, val in (
+            ("SYNC_TARGET_ENDPOINT", SYNC_TARGET_ENDPOINT),
+            ("SYNC_TARGET_KEY_ID",   SYNC_TARGET_KEY_ID),
+            ("SYNC_TARGET_SECRET",   SYNC_TARGET_SECRET),
+            ("SYNC_TARGET_BUCKET",   SYNC_TARGET_BUCKET),
+        ) if not val
+    ]
+    if missing:
+        return False, "Sync not configured — missing: " + ", ".join(missing)
+    if SYNC_VALIDATE_QUERY not in ("none", "src", "dst", "both"):
+        return False, f"SYNC_VALIDATE_QUERY must be none/src/dst/both (got {SYNC_VALIDATE_QUERY!r})"
+    for label, val in (("Seagate key", SEAGATE_KEY_ID), ("Seagate secret", SEAGATE_SECRET),
+                        ("Target key",  SYNC_TARGET_KEY_ID), ("Target secret",  SYNC_TARGET_SECRET)):
+        if "'" in val:
+            return False, f"{label} contains single-quote — s3() SQL would break"
+    return True, None
+
+
+def _ch_for_sync():
+    """ClickHouse client for sync validation queries.
+
+    Prefer CH_SYNC_VALIDATE_HOST if set, else reuse CH_COMPARE_CLOUD_HOST
+    (it already reads Seagate s3()).
+    """
+    host = CH_SYNC_VALIDATE_HOST or CH_COMPARE_CLOUD_HOST
+    user = CH_SYNC_VALIDATE_USER or CH_COMPARE_CLOUD_USER
+    pwd  = CH_SYNC_VALIDATE_PASSWORD or CH_COMPARE_CLOUD_PASSWORD
+    return clickhouse_driver.Client(
+        host=host, user=user, password=pwd, connect_timeout=30,
+    )
+
+
+_sync_lock = threading.Lock()
+
+
+def run_sync(target_month, validate_query=None):
+    """Mirror  Seagate rg-datalake-<year>/<table>/*.parquet  →  target cloud.
+
+    validate_query overrides SYNC_VALIDATE_QUERY for this run when given.
+    Thread-safe — serialised by _sync_lock; callers can invoke from API or
+    background.  Returns dict summarising the run.
+    """
+    with _sync_lock:
+        return _run_sync_locked(target_month, validate_query)
+
+
+def _run_sync_locked(target_month, validate_query):
+    year = target_month[:4]
+    src_bucket = f"rg-datalake-{year}"
+    dst_bucket = SYNC_TARGET_BUCKET
+    dst_prefix = SYNC_TARGET_PREFIX + ("/" + year if SYNC_TARGET_PREFIX else "")
+
+    ok, err = _validate_sync()
+    if not ok:
+        return {"status": "blocked", "error": err, "month": target_month}
+
+    mode = (validate_query or SYNC_VALIDATE_QUERY).strip().lower()
+    if mode not in ("none", "src", "dst", "both"):
+        return {"status": "blocked", "error": f"Invalid validate_query {mode!r}", "month": target_month}
+
+    now = _now()
+    conn = _get_db_thread()
+    try:
+        # Don't clobber a running sync for this month.
+        existing = conn.execute("SELECT * FROM sync_log WHERE month=?", (target_month,)).fetchone()
+        if existing and existing["status"] == "running":
+            return {"status": "already_running", "month": target_month,
+                    "sync_id": existing["id"]}
+
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_log (month, status, details, created_at, started_at, completed_at) "
+            "VALUES (?, 'running', '[]', ?, ?, NULL)",
+            (target_month, now, now),
+        )
+        conn.commit()
+        sync_row = conn.execute("SELECT id FROM sync_log WHERE month=?", (target_month,)).fetchone()
+        sync_id = sync_row["id"]
+
+        src = _boto_client(SEAGATE_ENDPOINT, SEAGATE_KEY_ID, SEAGATE_SECRET)
+        dst = _boto_client(SYNC_TARGET_ENDPOINT, SYNC_TARGET_KEY_ID, SYNC_TARGET_SECRET)
+
+        ch = None
+        if mode != "none":
+            try:
+                ch = _ch_for_sync()
+                # Smoke-test — a no-op SELECT so we fail early if CH is unreachable.
+                ch.execute("SELECT 1")
+            except Exception as exc:
+                _persist_sync(conn, sync_id, "failed", [], now, _now(),
+                              f"validation ClickHouse unavailable: {exc}")
+                return {"status": "failed", "error": f"validation ClickHouse unavailable: {exc}"}
+
+        src_prefix = ""   # list everything in rg-datalake-YYYY, year/table/file keys will follow
+        details = []
+
+        total_ok = 0
+        total_mismatch = 0
+        total_failed = 0
+        total_skipped = 0
+
+        # Iterate all tables for this month (so we only touch files that should exist
+        # for this month — avoids copying left-over files from other months).
+        for tpl in RG_TABLES:
+            table = tpl.format(m=target_month)
+            table_prefix = f"{table}/"
+            # Skip empty table folders — list_objects_v2 on a missing prefix is just empty.
+            files = list(_s3_list_parquets(src, src_bucket, table_prefix))
+            if not files:
+                continue
+
+            for key, src_size in files:
+                record = {"table": table, "file": key.split("/")[-1],
+                          "src_size_bytes": src_size}
+
+                dst_key = f"{dst_prefix}/{key}" if dst_prefix else key
+
+                # --- Idempotent skip: target exists and same size ---
+                dst_size = _s3_head_size(dst, dst_bucket, dst_key)
+                if dst_size is not None and dst_size == src_size:
+                    record["status"] = "skipped"
+                    total_skipped += 1
+                else:
+                    # --- Copy ---
+                    t0 = time.perf_counter()
+                    try:
+                        dst.copy(
+                            CopySource={"Bucket": src_bucket, "Key": key},
+                            Bucket=dst_bucket, Key=dst_key,
+                        )
+                        record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
+                    except Exception as exc:
+                        record["status"] = "copy_failed"
+                        record["error"] = str(exc)[:500]
+                        record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
+                        total_failed += 1
+                        details.append(record)
+                        _flush_sync_details(conn, sync_id, details)
+                        continue
+
+                    # Re-check — make sure the copy landed with the right size.
+                    new_dst_size = _s3_head_size(dst, dst_bucket, dst_key)
+                    record["dst_size_bytes"] = new_dst_size
+                    if new_dst_size is None or new_dst_size != src_size:
+                        record["status"] = "copy_failed"
+                        record["error"] = (f"post-copy size mismatch: src={src_size} "
+                                           f"dst={new_dst_size}")
+                        total_failed += 1
+                        details.append(record)
+                        _flush_sync_details(conn, sync_id, details)
+                        continue
+
+                # --- Validation (count WHERE <filter>) ---
+                if mode == "none":
+                    if record.get("status") != "skipped":
+                        record["status"] = "verified"
+                    total_ok += 1
+                    details.append(record)
+                    _flush_sync_details(conn, sync_id, details)
+                    continue
+
+                src_url = f"{SEAGATE_ENDPOINT}/{src_bucket}/{key}"
+                dst_url = f"{SYNC_TARGET_ENDPOINT}/{dst_bucket}/{dst_key}"
+
+                if mode in ("src", "both"):
+                    sc, sm, se = _clickhouse_s3_count_filtered(
+                        src_url, SEAGATE_KEY_ID, SEAGATE_SECRET,
+                        SYNC_VALIDATE_FILTER, ch,
+                    )
+                    record["src_count"] = sc
+                    record["src_ms"] = sm
+                    if se:
+                        record["src_err"] = se[:500]
+
+                if mode in ("dst", "both"):
+                    dc, dm, de = _clickhouse_s3_count_filtered(
+                        dst_url, SYNC_TARGET_KEY_ID, SYNC_TARGET_SECRET,
+                        SYNC_VALIDATE_FILTER, ch,
+                    )
+                    record["dst_count"] = dc
+                    record["dst_ms"] = dm
+                    if de:
+                        record["dst_err"] = de[:500]
+
+                if mode == "src":
+                    record["status"] = "verified" if record.get("src_count") is not None else "verify_failed"
+                elif mode == "dst":
+                    record["status"] = "verified" if record.get("dst_count") is not None else "verify_failed"
+                else:  # both
+                    sc = record.get("src_count")
+                    dc = record.get("dst_count")
+                    if sc is None or dc is None:
+                        record["status"] = "verify_failed"
+                    elif sc == dc:
+                        record["status"] = "verified"
+                    else:
+                        record["status"] = "mismatch"
+                        record["diff"] = dc - sc
+
+                if record["status"] == "verified" or record["status"] == "skipped":
+                    total_ok += 1
+                elif record["status"] == "mismatch":
+                    total_mismatch += 1
+                else:
+                    total_failed += 1
+
+                details.append(record)
+                _flush_sync_details(conn, sync_id, details)
+
+        if total_failed == 0 and total_mismatch == 0:
+            fin_status = "success"
+        elif total_failed == 0:
+            fin_status = "partial_failure"   # only mismatches
+        else:
+            fin_status = "partial_failure"   # copies / verifications failed too
+
+        _persist_sync(conn, sync_id, fin_status, details, now, _now(), summary=None,
+                      extra={"copied": total_ok, "mismatch": total_mismatch,
+                             "failed": total_failed, "skipped": total_skipped})
+
+        # Finalize sent an alert on success/failure — add one here too so
+        # operators don't have to check the dashboard.
+        _send_sync_alert(fin_status, target_month, total_ok, total_mismatch,
+                         total_failed, total_skipped)
+
+        return {"status": fin_status, "month": target_month,
+                "sync_id": sync_id,
+                "stats": {"ok": total_ok, "mismatch": total_mismatch,
+                          "failed": total_failed, "skipped": total_skipped}}
+    finally:
+        conn.close()
+
+
+def _flush_sync_details(conn, sync_id, details):
+    """Persist the running list of per-file records mid-run."""
+    try:
+        conn.execute(
+            "UPDATE sync_log SET details=? WHERE id=?",
+            (json.dumps(details), sync_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        print(f"[SYNC] flush details failed: {exc}")
+
+
+def _persist_sync(conn, sync_id, status, details, created_at, completed_at, error=None,
+                  extra=None):
+    payload = {"records": details or []}
+    if error:
+        payload["error"] = error
+    if extra:
+        payload["stats"] = extra
+    conn.execute(
+        "UPDATE sync_log SET status=?, details=?, completed_at=? WHERE id=?",
+        (status, json.dumps(payload), completed_at, sync_id),
+    )
+    conn.commit()
+
+
+def _send_sync_alert(status, month, ok, mismatch, failed, skipped):
+    title = f"RG Parquet sync — {month}"
+    msg = (f"Month: {month}\n"
+           f"ok={ok}  skipped={skipped}  mismatch={mismatch}  failed={failed}")
+    if status == "success":
+        send_alert(title, msg, "INFO", ["rg-parquet", "sync", "success"])
+    elif status == "partial_failure":
+        send_alert(title + "  PARTIAL", msg, "WARNING",
+                   ["rg-parquet", "sync", "partial-failure"])
+    else:
+        send_alert(title + "  FAILED", msg, "CRITICAL",
+                   ["rg-parquet", "sync", "failure", "p0"])
 
 
 # ============================================================
@@ -824,6 +1191,81 @@ def acknowledge_finalize(month):
     return jsonify({"ok": True, "month": month, "status": "acknowledged"})
 
 
+# ---- Sync ----
+@app.route("/api/sync/<month>", methods=["POST"])
+def start_sync(month):
+    """Manually trigger a Seagate → target cloud mirror for <month>.
+
+    Async — spins up a background thread, returns immediately with the
+    current sync_log row.  Body (optional):
+
+        {
+          "validate_query": "both"   // overrides SYNC_VALIDATE_QUERY
+                                      //   none | src | dst | both
+        }
+    """
+    auth_err = _check_auth()
+    if auth_err:
+        return auth_err
+
+    if not _valid_month(month):
+        return jsonify({"error": "Invalid month. Use YYYYMM (e.g. 202608)."}), 400
+
+    body = request.get_json(silent=True) or {}
+    vq = (body.get("validate_query") or "").strip().lower() or None
+
+    ok, err = _validate_sync()
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    conn = _get_db_thread()
+    existing = conn.execute("SELECT * FROM sync_log WHERE month=?", (month,)).fetchone()
+    conn.close()
+
+    if existing and existing["status"] == "running":
+        return jsonify({
+            "status": "already_running", "month": month,
+            "sync": _serialize_sync_row(existing),
+        })
+
+    # Kick off in a daemon thread so the request returns immediately.
+    t = threading.Thread(
+        target=_run_sync_locked, args=(month, vq), daemon=True,
+    )
+    t.start()
+
+    return jsonify({
+        "status": "started", "month": month,
+        "validate_query": vq or SYNC_VALIDATE_QUERY,
+    })
+
+
+@app.route("/api/sync/<month>", methods=["GET"])
+def get_sync(month):
+    """Fetch the most recent sync_log row for <month>."""
+    if not _valid_month(month):
+        return jsonify({"error": "Invalid month. Use YYYYMM."}), 400
+
+    db = get_db()
+    row = db.execute("SELECT * FROM sync_log WHERE month=?", (month,)).fetchone()
+    if not row:
+        return jsonify({"month": month, "status": "not_found"}), 404
+    return jsonify({"month": month, "sync": _serialize_sync_row(row)})
+
+
+def _serialize_sync_row(row):
+    """Turn a sqlite sync_log row into a JSON-friendly dict."""
+    d = dict(row)
+    try:
+        d["details_obj"] = json.loads(d["details"]) if d["details"] else []
+    except (TypeError, ValueError):
+        d["details_obj"] = []
+        d["details_error"] = "corrupt"
+    # Don't bloat the GET response — keep the raw JSON blob only when asked.
+    d.pop("details", None)
+    return d
+
+
 # ============================================================
 # Finalize logic
 # ============================================================
@@ -1192,14 +1634,22 @@ table.tbl td.warn{color:var(--yellow)}
   <div class="server-grid" id="servers"></div>
   <div class="actions">
     <input id="dispatch-month" placeholder="202608" maxlength="6">
-    <input id="api-token" type="password" placeholder="API Token" maxlength="128" style="max-width:180px" title="Enter the API token from .env to enable Dispatch / Finalize">
+    <input id="api-token" type="password" placeholder="API Token" maxlength="128" style="max-width:180px" title="Enter the API token from .env to enable Dispatch / Finalize / Sync">
     <button class="btn-primary" onclick="doDispatch()">Dispatch</button>
     <button class="btn-danger" onclick="doFinalize()">Finalize</button>
+    <button class="btn-primary" onclick="doSync()" title="Mirror parquet files to target S3-compatible cloud">Sync</button>
+    <select id="sync-validate" title="Which side(s) to validate">
+      <option value="none">validate: none</option>
+      <option value="src">validate: src</option>
+      <option value="dst">validate: dst</option>
+      <option value="both" selected>validate: both</option>
+    </select>
   </div>
   <div id="msg"></div>
 </div>
 
 <div id="finalize-section"></div>
+<div id="sync-section"></div>
 
 <div class="footer">Last update: <span id="last-update">&mdash;</span></div>
 
@@ -1343,6 +1793,87 @@ async function fetchStatus(){
       finSection.innerHTML='';
     }
 
+    // Sync section — fetch separately (d.finalize is from /api/status; sync
+    // lives in its own table so we hit /api/sync/<month> when we know one).
+    const syncSection=document.getElementById('sync-section');
+    if(d.month){
+      try{
+        const sr=await fetch(`/api/sync/${d.month}`);
+        if(sr.ok){
+          const sdata=await sr.json();
+          const sync=sdata.sync;
+          if(sync){
+            const recs=sync.details_obj||[];
+            const stats=(sync.details_obj&&sync.details_obj.length&&sync.details_obj[0].stats)||null;
+            // stats lives inside the last record's dict? No — we packed it as
+            // payload.stats separately. Walk all records to find one that has
+            // stats, or parse from the top-level details_obj if we can.
+            // Simpler: re-fetch with no detail (already done above).
+            let sHtml='<div class="card"><div class="card-header"><h2>Sync Results</h2>';
+            let statusCls='info';
+            if(sync.status==='running') statusCls='warn';
+            else if(sync.status==='success') statusCls='ok';
+            else if(sync.status==='partial_failure'||sync.status==='failed') statusCls='err';
+            sHtml+=pill(statusCls,sync.status);
+            sHtml+='</div>';
+            if(sync.started_at){
+              sHtml+='<div style="font-size:.7rem;color:var(--muted);margin-bottom:8px">'+
+                     'started '+sync.started_at+(sync.completed_at?'  ·  completed '+sync.completed_at:'')+
+                     '</div>';
+            }
+            // Count records by status
+            let verified=0,skipped=0,mismatch=0,failed=0;
+            recs.forEach(r=>{
+              if(r.status==='verified')verified++;
+              else if(r.status==='skipped')skipped++;
+              else if(r.status==='mismatch')mismatch++;
+              else failed++;
+            });
+            sHtml+=`<div style="font-size:.72rem;color:var(--muted);margin-bottom:10px">`+
+                   `records: ${recs.length} &middot; verified <b style="color:var(--green)">${verified}</b>`+
+                   (skipped?` &middot; skipped <b>${skipped}</b>`:'')+
+                   (mismatch?` &middot; mismatch <b style="color:var(--yellow)">${mismatch}</b>`:'')+
+                   (failed?` &middot; failed <b style="color:var(--red)">${failed}</b>`:'')+
+                   `</div>`;
+            if(recs.length){
+              sHtml+='<div class="fin-detail"><table><tr>'+
+                     '<th>Table</th><th>File</th><th>Status</th>'+
+                     '<th>size</th>'+
+                     '<th>src_count</th><th>src_ms</th>'+
+                     '<th>dst_count</th><th>dst_ms</th>'+
+                     '<th>copy_ms</th></tr>';
+              recs.forEach(r=>{
+                let cls='';
+                if(r.status==='verified'||r.status==='skipped')cls='ok';
+                else if(r.status==='mismatch')cls='warn';
+                else cls='err';
+                const fmt=(v)=>v===undefined||v===null?'—':v;
+                const msFmt=(v)=>v===undefined||v===null?'—':v+'ms';
+                sHtml+=`<tr><td style="font-size:.62rem">${r.table||''}</td>`+
+                       `<td style="font-size:.62rem;font-family:JetBrains Mono,monospace">${r.file||''}</td>`+
+                       `<td class="${cls}">${r.status}</td>`+
+                       `<td>${fmt(r.src_size_bytes)}</td>`+
+                       `<td>${fmt(r.src_count)}</td><td>${msFmt(r.src_ms)}</td>`+
+                       `<td>${fmt(r.dst_count)}</td><td>${msFmt(r.dst_ms)}</td>`+
+                       `<td>${msFmt(r.copy_ms)}</td></tr>`;
+              });
+              sHtml+='</table></div>';
+            }
+            sHtml+='</div>';
+            syncSection.innerHTML=sHtml;
+          } else {
+            syncSection.innerHTML='';
+          }
+        } else {
+          syncSection.innerHTML='';
+        }
+      }catch(_){
+        syncSection.innerHTML='';
+      }
+    } else {
+      syncSection.innerHTML='';
+    }
+
     document.getElementById('last-update').textContent=new Date().toLocaleTimeString();
   }catch(e){
     document.getElementById('msg').textContent='Error: '+e.message;
@@ -1424,6 +1955,30 @@ async function doAcknowledge(month){
   }catch(e){showMsg('Error: '+e.message)}
 }
 
+async function doSync(){
+  if(!apiToken()){showMsg('Enter the API Token first');return}
+  const m=document.getElementById('dispatch-month').value.trim();
+  if(!m){showMsg('Enter a month (YYYYMM) to sync');return}
+  const vq=document.getElementById('sync-validate').value;
+  showMsg('Starting sync... (this may run a long time)');
+  try{
+    const r=await fetch(`/api/sync/${m}`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-API-Token':apiToken()},
+      body:JSON.stringify({validate_query:vq}),
+    });
+    const d=await r.json();
+    if(r.ok){
+      if(d.status==='started') showMsg(`Sync started for ${m} (validate=${vq||'both'})`);
+      else if(d.status==='already_running') showMsg(`Sync already running for ${m}`);
+      else showMsg(`Sync: ${d.status}`);
+    } else {
+      showMsg(`Sync failed (HTTP ${r.status}): ${d.error||d.message}`);
+    }
+    fetchStatus();
+  }catch(e){showMsg('Error: '+e.message)}
+}
+
 async function doReset(taskId,srv,status){
   if(!apiToken()){showMsg('Enter the API Token first');return}
   const force = status==='progress';
@@ -1472,6 +2027,16 @@ if __name__ == "__main__":
             "[Controller] ** WARNING: Seagate credentials contain single-quote — "
             "cross-validation S3 queries will fail. Regenerate credentials without quotes."
         )
+
+    if SYNC_TARGET_ENDPOINT and not SYNC_TARGET_BUCKET:
+        print(
+            "[Controller] ** WARNING: SYNC_TARGET_ENDPOINT is set but SYNC_TARGET_BUCKET "
+            "is empty — sync via /api/sync will fail."
+        )
+    for label, val in (("Seagate key", SEAGATE_KEY_ID), ("Seagate secret", SEAGATE_SECRET),
+                        ("Target key",  SYNC_TARGET_KEY_ID), ("Target secret",  SYNC_TARGET_SECRET)):
+        if "'" in val:
+            print(f"[Controller] ** WARNING: {label} contains single-quote — sync validation queries will fail.")
 
     t = threading.Thread(target=background_loop, daemon=True)
     t.start()
