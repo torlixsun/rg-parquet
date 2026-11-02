@@ -189,6 +189,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_tts_task     ON task_table_status(task_id);
         """
     )
+    # Schema migration — ADD COLUMN is idempotent enough here; just skip
+    # if the column already exists.  Running hint lets the Dashboard show
+    # "processing X.parquet" between flushes so it never looks stuck.
+    try:
+        conn.execute("ALTER TABLE sync_log ADD COLUMN running_hint TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -515,7 +522,18 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                 continue
 
             for key, src_size in files:
-                record = {"table": table, "file": key.split("/")[-1],
+                fname = key.split("/")[-1]
+                # Eager hint — flush BEFORE any slow ClickHouse / S3 op so the
+                # Dashboard never looks stuck even when a single count() takes
+                # 400+ seconds.
+                if action == "validate_only":
+                    _flush_sync_details(conn, sync_id, details,
+                                        hint=f"Validating {table} / {fname} (querying source + target)...")
+                else:
+                    _flush_sync_details(conn, sync_id, details,
+                                        hint=f"Syncing {table} / {fname} (size {src_size})")
+
+                record = {"table": table, "file": fname,
                           "src_size_bytes": src_size}
 
                 dst_key = f"{dst_prefix}/{key}" if dst_prefix else key
@@ -530,7 +548,8 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                         total_missing += 1
                         total_failed += 1
                         details.append(record)
-                        _flush_sync_details(conn, sync_id, details)
+                        _flush_sync_details(conn, sync_id, details,
+                                            hint=f"{table}/{fname}: missing on target cloud")
                         continue
                     record["dst_size_bytes"] = dst_size
                 else:
@@ -552,7 +571,8 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                             record["copy_ms"] = int((time.perf_counter() - t0) * 1000)
                             total_failed += 1
                             details.append(record)
-                            _flush_sync_details(conn, sync_id, details)
+                            _flush_sync_details(conn, sync_id, details,
+                                                hint=f"{table}/{fname}: copy failed ({record['copy_ms']}ms)")
                             continue
 
                         new_dst_size = _s3_head_size(dst, dst_bucket, dst_key)
@@ -563,7 +583,8 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                                                f"dst={new_dst_size}")
                             total_failed += 1
                             details.append(record)
-                            _flush_sync_details(conn, sync_id, details)
+                            _flush_sync_details(conn, sync_id, details,
+                                                hint=f"{table}/{fname}: post-copy size mismatch")
                             continue
 
                 # --- Validation (count WHERE <filter>) ---
@@ -572,7 +593,7 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                         record["status"] = "verified"
                     total_ok += 1
                     details.append(record)
-                    _flush_sync_details(conn, sync_id, details)
+                    _flush_sync_details(conn, sync_id, details, hint=None)
                     continue
 
                 src_url = f"{SEAGATE_ENDPOINT}/{src_bucket}/{key}"
@@ -621,7 +642,10 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
                     total_failed += 1
 
                 details.append(record)
-                _flush_sync_details(conn, sync_id, details)
+                # Clear the hint after we finish each file so the Dashboard
+                # doesn't keep showing the "processing X.parquet" text once
+                # that record has landed in details_obj.
+                _flush_sync_details(conn, sync_id, details, hint=None)
 
         # Final status
         if total_failed == 0 and total_mismatch == 0:
@@ -631,9 +655,12 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
         else:
             fin_status = "partial_failure"   # copies / verifications failed too
 
+        # Pack total known count into stats so the Dashboard progress bar has
+        # an exact denominator instead of the 192 fallback guess.
         _persist_sync(conn, sync_id, fin_status, details, now, _now(), summary=None,
-                      extra={"copied": total_ok, "mismatch": total_mismatch,
-                             "failed": total_failed, "skipped": total_skipped})
+                      extra={"total": len(details), "ok": total_ok,
+                             "mismatch": total_mismatch, "failed": total_failed,
+                             "skipped": total_skipped, "missing": total_missing})
 
         # Finalize sent an alert on success/failure — add one here too so
         # operators don't have to check the dashboard.
@@ -648,13 +675,22 @@ def _run_sync_locked(target_month, validate_query, action="sync"):
         conn.close()
 
 
-def _flush_sync_details(conn, sync_id, details):
-    """Persist the running list of per-file records mid-run."""
+def _flush_sync_details(conn, sync_id, details, hint=None):
+    """Persist the running list of per-file records mid-run, plus the
+    optional human-readable hint ("processing X.parquet") so the Dashboard
+    can always show progress even before the first ClickHouse count()
+    completes."""
     try:
-        conn.execute(
-            "UPDATE sync_log SET details=? WHERE id=?",
-            (json.dumps(details), sync_id),
-        )
+        if hint is not None:
+            conn.execute(
+                "UPDATE sync_log SET details=?, running_hint=? WHERE id=?",
+                (json.dumps(details), hint, sync_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE sync_log SET details=? WHERE id=?",
+                (json.dumps(details), sync_id),
+            )
         conn.commit()
     except Exception as exc:
         print(f"[SYNC] flush details failed: {exc}")
@@ -667,8 +703,10 @@ def _persist_sync(conn, sync_id, status, details, created_at, completed_at, erro
         payload["error"] = error
     if extra:
         payload["stats"] = extra
+    # Also clear running_hint — the run is done, so there's no "next file"
+    # to hint at.  Keeps the post-run Dashboard clean.
     conn.execute(
-        "UPDATE sync_log SET status=?, details=?, completed_at=? WHERE id=?",
+        "UPDATE sync_log SET status=?, details=?, completed_at=?, running_hint=NULL WHERE id=?",
         (status, json.dumps(payload), completed_at, sync_id),
     )
     conn.commit()
@@ -1279,14 +1317,27 @@ def get_sync(month):
 
 
 def _serialize_sync_row(row):
-    """Turn a sqlite sync_log row into a JSON-friendly dict."""
+    """Turn a sqlite sync_log row into a JSON-friendly dict.
+
+    details column stores EITHER a plain per-file array  OR  a wrapped
+    {"records": [...], "stats": {...}, "error": "..."} object (used at the
+    end of a run).  Normalize both shapes so consumers always get
+    .details_obj as a flat array.
+    """
     d = dict(row)
     try:
-        d["details_obj"] = json.loads(d["details"]) if d["details"] else []
+        parsed = json.loads(d["details"]) if d["details"] else []
+        if isinstance(parsed, dict):
+            d["details_obj"] = parsed.get("records", [])
+            if "stats" in parsed:
+                d["stats"] = parsed["stats"]
+            if "error" in parsed:
+                d["error_msg"] = parsed["error"]
+        else:
+            d["details_obj"] = parsed or []
     except (TypeError, ValueError):
         d["details_obj"] = []
         d["details_error"] = "corrupt"
-    # Don't bloat the GET response — keep the raw JSON blob only when asked.
     d.pop("details", None)
     return d
 
@@ -1545,6 +1596,7 @@ header h1 span{color:var(--accent)}
 .refresh-badge{display:flex;align-items:center;gap:6px;font-size:.78rem;color:var(--muted);background:var(--surface);padding:5px 12px;border-radius:20px;border:1px solid var(--border)}
 .refresh-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 
 .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:24px}
 @media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
@@ -1830,37 +1882,77 @@ async function fetchStatus(){
           const sync=sdata.sync;
           if(sync){
             const recs=sync.details_obj||[];
-            const stats=(sync.details_obj&&sync.details_obj.length&&sync.details_obj[0].stats)||null;
-            // stats lives inside the last record's dict? No — we packed it as
-            // payload.stats separately. Walk all records to find one that has
-            // stats, or parse from the top-level details_obj if we can.
-            // Simpler: re-fetch with no detail (already done above).
+            const stats=sync.stats||null;
             let sHtml='<div class="card"><div class="card-header"><h2>Sync Results</h2>';
             let statusCls='info';
-            if(sync.status==='running') statusCls='warn';
+            if(sync.status==='running'||sync.status==='validate_only') statusCls='warn';
             else if(sync.status==='success') statusCls='ok';
             else if(sync.status==='partial_failure'||sync.status==='failed') statusCls='err';
             sHtml+=pill(statusCls,sync.status);
+            // Highlight validate_only mode so it's visually distinct from a full sync run.
+            if(sync.status==='validate_only'){
+              sHtml+=`<span style="font-size:.62rem;background:#7c3aed;color:#fff;padding:2px 8px;border-radius:10px;margin-left:6px">validate_only</span>`;
+            }
             sHtml+='</div>';
+
+            // Timestamps
             if(sync.started_at){
               sHtml+='<div style="font-size:.7rem;color:var(--muted);margin-bottom:8px">'+
                      'started '+sync.started_at+(sync.completed_at?'  ·  completed '+sync.completed_at:'')+
                      '</div>';
             }
+
+            // Progress bar — always render, even at 0%.  If we have a stats
+            // object (packed by the backend at the end), use total from there;
+            // otherwise fall back to 192 (16 tables * 12 servers) as an
+            // estimate so we show SOMETHING instead of a dead 0/0.
+            const knownTotal = (stats && stats.total) || 0;
+            const estTotal = knownTotal > 0 ? knownTotal : 192;
+            const pct = estTotal > 0 ? Math.min(100, Math.round(recs.length / estTotal * 100)) : 0;
+            sHtml+=`<div style="background:var(--border);border-radius:4px;height:10px;margin-bottom:6px;overflow:hidden">`+
+                   `<div style="height:100%;width:${pct}%;background:linear-gradient(90deg,var(--green),#34d399);transition:width 0.4s"></div>`+
+                   `</div>`;
+
             // Count records by status
-            let verified=0,skipped=0,mismatch=0,failed=0;
+            let verified=0,skipped=0,mismatch=0,failed=0,missing=0;
             recs.forEach(r=>{
               if(r.status==='verified')verified++;
               else if(r.status==='skipped')skipped++;
               else if(r.status==='mismatch')mismatch++;
+              else if(r.status==='missing_on_target')missing++;
               else failed++;
             });
+            const totalDone = verified+skipped+mismatch+failed+missing;
+
+            // Summary line — include progress so users can see we ARE making
+            // headway even when the first ClickHouse WHERE-filter count takes
+            // ~400 seconds per file.
             sHtml+=`<div style="font-size:.72rem;color:var(--muted);margin-bottom:10px">`+
-                   `records: ${recs.length} &middot; verified <b style="color:var(--green)">${verified}</b>`+
+                   `<b style="color:var(--fg)">${totalDone}/${estTotal}</b> · ${pct}%`+
+                   ` &middot; verified <b style="color:var(--green)">${verified}</b>`+
                    (skipped?` &middot; skipped <b>${skipped}</b>`:'')+
                    (mismatch?` &middot; mismatch <b style="color:var(--yellow)">${mismatch}</b>`:'')+
+                   (missing?` &middot; missing <b style="color:var(--red)">${missing}</b>`:'')+
                    (failed?` &middot; failed <b style="color:var(--red)">${failed}</b>`:'')+
                    `</div>`;
+
+            // Running hint — if we're mid-run AND haven't flushed any records
+            // yet (first ClickHouse count is still cooking), surface a spinner
+            // so the UI clearly says "something is happening".
+            const hint = sync.running_hint || null;
+            if((sync.status==='running'||sync.status==='validate_only') && recs.length===0){
+              sHtml+=`<div style="display:flex;align-items:center;gap:8px;font-size:.72rem;color:var(--muted);margin-bottom:10px">`+
+                     `<div style="width:14px;height:14px;border:2px solid var(--border);border-top-color:#34d399;border-radius:50%;animation:spin 0.9s linear infinite"></div>`+
+                     `${hint?hint:'Enumerating parquet files and starting first validation...'}`+
+                     `</div>`;
+            } else if(hint && (sync.status==='running'||sync.status==='validate_only')){
+              // We have records AND a hint — show hint under the progress bar
+              // so you know which file is being worked on NEXT.
+              sHtml+=`<div style="font-size:.7rem;color:var(--muted);margin-bottom:8px;padding:4px 8px;background:rgba(52,211,153,.06);border-left:2px solid #34d399">`+
+                     `<div style="display:inline-block;width:8px;height:8px;background:#34d399;border-radius:50%;margin-right:6px;animation:pulse 1.2s ease-in-out infinite"></div>`+
+                     `${hint}</div>`;
+            }
+
             if(recs.length){
               sHtml+='<div class="fin-detail"><table><tr>'+
                      '<th>Table</th><th>File</th><th>Status</th>'+
@@ -1884,6 +1976,9 @@ async function fetchStatus(){
                        `<td>${msFmt(r.copy_ms)}</td></tr>`;
               });
               sHtml+='</table></div>';
+            }
+            if(sync.error_msg){
+              sHtml+=`<div class="err" style="font-size:.7rem;margin-top:8px">Error: ${sync.error_msg}</div>`;
             }
             sHtml+='</div>';
             syncSection.innerHTML=sHtml;
