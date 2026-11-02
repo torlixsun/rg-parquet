@@ -444,7 +444,10 @@ def run_sync(target_month, validate_query=None):
 def _run_sync_locked(target_month, validate_query):
     year = target_month[:4]
     src_bucket = f"rg-datalake-{year}"
-    dst_bucket = SYNC_TARGET_BUCKET
+    # SYNC_TARGET_BUCKET can be either a plain bucket name OR a template that
+    # mirrors the source layout, e.g.  "rg-datalake-{year}"  →  rg-datalake-2026.
+    # Plain fixed names like  "rg-backup"  work unchanged.
+    dst_bucket = SYNC_TARGET_BUCKET.format(year=year) if SYNC_TARGET_BUCKET else ""
     dst_prefix = SYNC_TARGET_PREFIX + ("/" + year if SYNC_TARGET_PREFIX else "")
 
     ok, err = _validate_sync()
