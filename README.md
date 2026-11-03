@@ -266,7 +266,3 @@ Mutating endpoints require header `X-API-Token: <API_TOKEN>`. GET endpoints stay
 ├── start_controller.sh       # Controller startup
 └── README.md                 # This file
 ```
-
-## Legacy (Celery + Redis)
-
-The previous Celery-based architecture (`rg_celery_app.py`, `rg_celery_coordinator.py`, `start_master.sh`, `start_worker.sh`, `docker-compose.yml`, `redis.conf`, `trigger_dispatch.sh`, `requirements_celery.txt`, `architecture.md`) has been removed from the repository. See git history for the legacy code.
